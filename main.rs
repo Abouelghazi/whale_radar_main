@@ -202,6 +202,13 @@ struct TickerState {
     last_anom_strength: Option<f64>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct OrderbookState {
+    bids: Vec<(f64, f64)>,  // (price, volume)
+    asks: Vec<(f64, f64)>,  // (price, volume)
+    timestamp: i64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct Row {
     pair: String,
@@ -445,6 +452,7 @@ struct Engine {
 trades: Arc<DashMap<String, TradeState>>,
     candles: Arc<DashMap<String, CandleState>>,
     tickers: Arc<DashMap<String, TickerState>>,
+    orderbooks: Arc<DashMap<String, OrderbookState>>,
     signals: Arc<Mutex<Vec<SignalEvent>>>,
     signalled_pairs: Arc<DashMap<String, bool>>,
     weights: Arc<Mutex<ScoreWeights>>,
@@ -458,6 +466,7 @@ impl Engine {
             trades: Arc::new(DashMap::new()),
             candles: Arc::new(DashMap::new()),
             tickers: Arc::new(DashMap::new()),
+            orderbooks: Arc::new(DashMap::new()),
             signals: Arc::new(Mutex::new(Vec::new())),
             signalled_pairs: Arc::new(DashMap::new()),
             weights: Arc::new(Mutex::new(ScoreWeights::default())),
@@ -697,6 +706,44 @@ impl Engine {
             } else {
                 whale_score = 1.0;
             }
+        }
+
+        // -------------------- Orderbook analysis --------------------
+        // Adjust whale_score based on orderbook walls (buy/sell pressure)
+        if let Some(ob) = self.orderbooks.get(pair) {
+            let age = ts_int.saturating_sub(ob.timestamp);
+            // Only use recent orderbook data (within 10 seconds)
+            if age >= 0 && age <= 10 {
+                // Calculate total volume in top bids and asks
+                let bid_volume: f64 = ob.bids.iter().take(10).map(|(_, v)| v).sum();
+                let ask_volume: f64 = ob.asks.iter().take(10).map(|(_, v)| v).sum();
+                let total_volume = bid_volume + ask_volume;
+
+                if total_volume > 0.0 {
+                    let bid_ratio = bid_volume / total_volume;
+                    
+                    // If there's a large buy wall (high bid volume) and we're seeing buy trades
+                    if side == "b" && bid_ratio > 0.65 {
+                        whale_score += 0.5; // Boost score for buy pressure
+                    }
+                    // If there's a large sell wall (high ask volume) and we're seeing sell trades
+                    else if side == "s" && bid_ratio < 0.35 {
+                        whale_score += 0.5; // Boost score for sell pressure
+                    }
+
+                    // Additional boost for extreme imbalances
+                    if bid_ratio > 0.75 && side == "b" {
+                        whale_score += 0.3;
+                    } else if bid_ratio < 0.25 && side == "s" {
+                        whale_score += 0.3;
+                    }
+                }
+            }
+        }
+
+        // Clamp whale_score to reasonable range
+        if whale_score > 4.0 {
+            whale_score = 4.0;
         }
 
         let mut volume_score = 0.0;
@@ -2826,6 +2873,158 @@ async fn run_kraken_worker(
     }
 }
 
+async fn run_orderbook_worker(
+    engine: Engine,
+    ws_pairs: Vec<String>,
+    worker_id: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let url = "wss://ws.kraken.com";
+
+    loop {
+        println!(
+            "OB_WS{}: connecting to Kraken orderbook ({} pairs)...",
+            worker_id,
+            ws_pairs.len()
+        );
+
+        let connect_res = connect_async(url).await;
+        let (ws, _) = match connect_res {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("OB_WS{}: connect error {:?}, retry in 5s", worker_id, e);
+                sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+        };
+
+        println!("OB_WS{}: connected", worker_id);
+
+        let (mut write, mut read) = ws.split();
+
+        // Subscribe to orderbook updates (depth 10)
+        let sub = serde_json::json!({
+            "event": "subscribe",
+            "pair": ws_pairs,
+            "subscription": { "name": "book", "depth": 10 }
+        });
+
+        if let Err(e) = write.send(Message::Text(sub.to_string())).await {
+            eprintln!(
+                "OB_WS{}: subscribe send error {:?}, reconnecting...",
+                worker_id, e
+            );
+            sleep(Duration::from_secs(5)).await;
+            continue;
+        }
+
+        println!(
+            "OB_WS{}: subscribed to orderbook for {} pairs",
+            worker_id,
+            ws_pairs.len()
+        );
+
+        while let Some(msg_res) = read.next().await {
+            let msg = match msg_res {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("OB_WS{}: read error {:?}, reconnecting...", worker_id, e);
+                    break;
+                }
+            };
+
+            if let Ok(txt) = msg.to_text() {
+                if txt.contains("\"event\"") {
+                    continue;
+                }
+                if let Ok(val) = serde_json::from_str::<Value>(txt) {
+                    if val.is_array() {
+                        let arr = val.as_array().unwrap();
+                        if arr.len() >= 4 {
+                            let pair_raw = arr[arr.len() - 1].as_str().unwrap_or("UNKNOWN");
+                            let pair = normalize_pair(pair_raw);
+
+                            // Parse orderbook data
+                            if let Some(data) = arr.get(1).and_then(|v| v.as_object()) {
+                                let ts_int = chrono::Utc::now().timestamp();
+                                let mut bids: Vec<(f64, f64)> = Vec::new();
+                                let mut asks: Vec<(f64, f64)> = Vec::new();
+
+                                // Parse bids (either 'b' or 'bs')
+                                if let Some(bid_arr) = data.get("b").or_else(|| data.get("bs")) {
+                                    if let Some(bid_list) = bid_arr.as_array() {
+                                        for item in bid_list {
+                                            if let Some(bid) = item.as_array() {
+                                                if bid.len() >= 2 {
+                                                    let price: f64 = bid[0]
+                                                        .as_str()
+                                                        .unwrap_or("0")
+                                                        .parse()
+                                                        .unwrap_or(0.0);
+                                                    let volume: f64 = bid[1]
+                                                        .as_str()
+                                                        .unwrap_or("0")
+                                                        .parse()
+                                                        .unwrap_or(0.0);
+                                                    if price > 0.0 && volume > 0.0 {
+                                                        bids.push((price, volume));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Parse asks (either 'a' or 'as')
+                                if let Some(ask_arr) = data.get("a").or_else(|| data.get("as")) {
+                                    if let Some(ask_list) = ask_arr.as_array() {
+                                        for item in ask_list {
+                                            if let Some(ask) = item.as_array() {
+                                                if ask.len() >= 2 {
+                                                    let price: f64 = ask[0]
+                                                        .as_str()
+                                                        .unwrap_or("0")
+                                                        .parse()
+                                                        .unwrap_or(0.0);
+                                                    let volume: f64 = ask[1]
+                                                        .as_str()
+                                                        .unwrap_or("0")
+                                                        .parse()
+                                                        .unwrap_or(0.0);
+                                                    if price > 0.0 && volume > 0.0 {
+                                                        asks.push((price, volume));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Update orderbook in engine if we have data
+                                if !bids.is_empty() || !asks.is_empty() {
+                                    // Sort bids descending (highest first)
+                                    bids.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+                                    // Sort asks ascending (lowest first)
+                                    asks.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+
+                                    let ob_state = OrderbookState {
+                                        bids,
+                                        asks,
+                                        timestamp: ts_int,
+                                    };
+                                    engine.orderbooks.insert(pair.clone(), ob_state);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        eprintln!("OB_WS{}: stream ended, reconnecting in 5s...", worker_id);
+        sleep(Duration::from_secs(5)).await;
+    }
+}
+
 // ============================================================================
 // HOOFDSTUK 11 – REST ANOMALY SCANNER
 // ============================================================================
@@ -2984,6 +3183,7 @@ async fn run_cleanup(engine: Engine) {
         let now = Utc::now().timestamp();
         let cutoff_trades = now - 12 * 3600;
         let cutoff_candles = now - 24 * 3600;
+        let cutoff_orderbooks = now - 60; // Remove orderbooks older than 1 minute
 
         engine.trades.retain(|_, v| v.last_update_ts >= cutoff_trades);
 
@@ -2998,7 +3198,10 @@ async fn run_cleanup(engine: Engine) {
             engine.candles.insert(k, CandleState::default());
         }
 
-        println!("Cleanup: oude trades (>12u) en candles (>24u) opgeschoond.");
+        // Cleanup old orderbooks
+        engine.orderbooks.retain(|_, v| v.timestamp >= cutoff_orderbooks);
+
+        println!("Cleanup: oude trades (>12u), candles (>24u) en orderbooks (>1m) opgeschoond.");
     }
 }
 
@@ -3130,11 +3333,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let engine = Engine::new();
     let engine_for_ws = engine.clone();
 
+    // Clone chunks for orderbook workers
+    let ob_chunks: Vec<Vec<String>> = ws_pairs.chunks(20).map(|c| c.to_vec()).collect();
+
+    // Spawn trade WebSocket workers
     for (i, chunk) in chunks.into_iter().enumerate() {
         let e = engine_for_ws.clone();
         tokio::spawn(async move {
             if let Err(err) = run_kraken_worker(e, chunk, i).await {
                 eprintln!("WS worker {} terminated with error: {:?}", i, err);
+            }
+        });
+    }
+
+    // Spawn orderbook WebSocket workers
+    let engine_for_ob = engine.clone();
+    for (i, chunk) in ob_chunks.into_iter().enumerate() {
+        let e = engine_for_ob.clone();
+        tokio::spawn(async move {
+            if let Err(err) = run_orderbook_worker(e, chunk, i).await {
+                eprintln!("OB worker {} terminated with error: {:?}", i, err);
             }
         });
     }

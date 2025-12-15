@@ -1,0 +1,19 @@
+[package]
+name = "whale_radar"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "whale_radar"
+path = "main.rs"
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+dashmap = "6.1"
+futures = "0.3"
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.24"
+warp = "0.3"
