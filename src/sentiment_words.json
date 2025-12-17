@@ -1,0 +1,4 @@
+{
+  "positive": ["bull", "rally", "surge", "pump", "rise", "green", "up", "buy", "bullish", "gains", "soars"],
+  "negative": ["bear", "crash", "dump", "fall", "red", "down", "sell", "drop", "bearish", "losses", "plunges"]
+}

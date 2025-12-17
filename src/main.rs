@@ -64,6 +64,13 @@ lazy_static! {
     };
 }
 
+lazy_static! {
+    static ref SENTIMENT_MAP: HashMap<String, Vec<String>> = {
+        let json_str = include_str!("sentiment_words.json");
+        serde_json::from_str(json_str).expect("Failed to parse sentiment_words.json")
+    };
+}
+
 // ============================================================================
 // HOOFDSTUK 1 – CONFIGURATIE & CONSTANTES
 // ============================================================================
@@ -3703,8 +3710,8 @@ async fn run_news_scanner(engine: Engine) -> Result<(), Box<dyn std::error::Erro
                     for item in channel.items {
                         if let Some(title) = item.title {
                             // Eenvoudige sentiment analyse: tel positieve/negatieve woorden
-                            let positive_words = vec!["bull", "rally", "surge", "pump", "rise", "green", "up", "buy", "bullish", "gains", "soars"];
-                            let negative_words = vec!["bear", "crash", "dump", "fall", "red", "down", "sell", "drop", "bearish", "losses", "plunges"];
+                            let positive_words = SENTIMENT_MAP.get("positive").cloned().unwrap_or_default();
+                            let negative_words = SENTIMENT_MAP.get("negative").cloned().unwrap_or_default();
 
                             let title_lower = title.to_lowercase();
                             let pos_count: usize = positive_words.iter().map(|w| title_lower.matches(w).count()).sum();
