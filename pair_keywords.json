@@ -1,0 +1,10 @@
+{
+  "bitcoin": "BTC/EUR",
+  "btc": "BTC/EUR",
+  "ethereum": "ETH/EUR",
+  "eth": "ETH/EUR",
+  "xrp": "XRP/EUR",
+  "ripple": "XRP/EUR",
+  "doge": "DOGE/EUR",
+  "dogecoin": "DOGE/EUR"
+}
