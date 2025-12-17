@@ -13,7 +13,6 @@
 //     6.1 Trade verwerking (WebSocket)
 //     6.2 Ticker & anomaly verwerking (REST)
 //     6.3 Analyse & snapshots
-//     6.4 Trader integratie
 //  7. Betrouwbaarheid & kwaliteitsscores
 //  8. Normalisatie (assets & pairs)
 //  9. Frontend (HTML dashboard)
@@ -31,9 +30,11 @@ use chrono::Utc;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
 use reqwest;
+use rss::Channel;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::io::Cursor;
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 use tokio::time::{sleep, Duration};
@@ -44,6 +45,128 @@ use warp::Filter;
 // ============================================================================
 // HOOFDSTUK 1 – CONFIGURATIE & CONSTANTES
 // ============================================================================
+
+// NIEUW: Uitgebreide Config struct voor alle aanpasbare instellingen
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AppConfig {
+    // 1. Signal Drempels
+    pump_conf_threshold: f64,
+    whale_pred_high_threshold: f64,
+    early_buy_threshold: f64,
+    alpha_buy_threshold: f64,
+    strong_buy_threshold: f64,
+    whale_min_notional: f64,
+    anomaly_strength_threshold: f64,
+
+    // 2. Score Gewichten
+    flow_weight: f64,
+    price_weight: f64,
+    whale_weight: f64,
+    volume_weight: f64,
+    anomaly_weight: f64,
+    trend_weight: f64,
+
+    // 3. Paper Trading Instellingen
+    initial_balance: f64,
+    base_notional: f64,
+    sl_pct: f64,
+    tp_pct: f64,
+    max_positions: usize,
+    enable_trading: bool,
+
+    // 4. Engine & Data Instellingen
+    ws_workers_per_chunk: usize,
+    rest_scan_interval_sec: u64,
+    cleanup_interval_sec: u64,
+    eval_horizon_sec: i64,
+    max_history: usize,
+
+    // 5. UI & Filter Instellingen
+    default_dir_filter: String,
+    include_stablecoins_default: bool,
+    heatmap_min_radius: f64,
+    heatmap_max_radius: f64,
+    chart_refresh_rate_sec: f64,
+
+    // 6. AI & Self-Learning Instellingen
+    ai_success_threshold: f64,
+    ai_adjustment_step_up: f64,
+    ai_adjustment_step_down: f64,
+    ai_max_weight: f64,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            // Signal Drempels
+            pump_conf_threshold: 0.7,
+            whale_pred_high_threshold: 8.0,
+            early_buy_threshold: 3.0,
+            alpha_buy_threshold: 7.5,
+            strong_buy_threshold: 5.0,
+            whale_min_notional: 5000.0,
+            anomaly_strength_threshold: 40.0,
+
+            // Score Gewichten
+            flow_weight: 2.2,
+            price_weight: 0.7,
+            whale_weight: 1.4,
+            volume_weight: 1.3,
+            anomaly_weight: 1.5,
+            trend_weight: 1.1,
+
+            // Paper Trading
+            initial_balance: 10000.0,
+            base_notional: 100.0,
+            sl_pct: 0.02,
+            tp_pct: 0.05,
+            max_positions: 5,
+            enable_trading: true,
+
+            // Engine & Data
+            ws_workers_per_chunk: 20,
+            rest_scan_interval_sec: 20,
+            cleanup_interval_sec: 600,
+            eval_horizon_sec: 300,
+            max_history: 400,
+
+            // UI & Filter
+            default_dir_filter: "ALL".to_string(),
+            include_stablecoins_default: true,
+            heatmap_min_radius: 4.0,
+            heatmap_max_radius: 12.0,
+            chart_refresh_rate_sec: 1.0,
+
+            // AI & Self-Learning
+            ai_success_threshold: 0.7,
+            ai_adjustment_step_up: 1.02,
+            ai_adjustment_step_down: 0.98,
+            ai_max_weight: 5.0,
+        }
+    }
+}
+
+// Functies voor config laden/opslaan
+const CONFIG_FILE: &str = "config.json";
+
+async fn load_config() -> AppConfig {
+    match tokio::fs::read_to_string(CONFIG_FILE).await {
+        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+        Err(_) => {
+            let default = AppConfig::default();
+            if let Ok(json) = serde_json::to_string_pretty(&default) {
+                let _ = tokio::fs::write(CONFIG_FILE, json).await;
+            }
+            default
+        }
+    }
+}
+
+async fn save_config(config: &AppConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let json = serde_json::to_string_pretty(config)?;
+    tokio::fs::write(CONFIG_FILE, json).await?;
+    Ok(())
+}
 
 // ============================================================================
 // HOOFDSTUK 2 – BAYESIAANS AI / ZELFLEREND SYSTEEM
@@ -174,6 +297,9 @@ struct TradeState {
     whale_pred_label: Option<String>,
 
     last_update_ts: i64,
+
+    // NIEUW: Nieuws-sentiment integratie (stap 1)
+    news_sentiment: f64,  // 0.0 = negatief, 1.0 = positief, default 0.5
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -200,6 +326,13 @@ struct TickerState {
     last_anom_ts: Option<i64>,
     last_anom_dir: Option<String>,
     last_anom_strength: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct OrderbookState {
+    bids: Vec<(f64, f64)>,  // (price, volume)
+    asks: Vec<(f64, f64)>,  // (price, volume)
+    timestamp: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -314,6 +447,9 @@ struct TopRow {
     // reliability fields
     reliability_score: f64,
     reliability_label: String,
+
+    // toegevoegd: signal_type
+    signal_type: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -329,6 +465,7 @@ struct HeatmapPoint {
     flow_pct: f64,
     pump_score: f64,
     ts: i64,
+    reliability_score: f64,  // TOEGEVOEGD: REL voor heatmap
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -356,31 +493,6 @@ struct BacktestResult {
 // ============================================================================
 
 
-#[derive(Debug, Clone, Serialize)]
-struct TradeAdviceRow {
-    pair: String,
-    price: f64,
-    entry_price: f64,
-    exit_5: f64,
-    exit_10: f64,
-    exit_15: f64,
-    exit_20: f64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct TradeAdviceEquity {
-    equity_5: f64,
-    equity_10: f64,
-    equity_15: f64,
-    equity_20: f64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct TradeAdviceResponse {
-    rows: Vec<TradeAdviceRow>,
-    equity: TradeAdviceEquity,
-}
-
 #[derive(Debug, Clone)]
 struct Position {
     pair: String,
@@ -391,6 +503,18 @@ struct Position {
     take_profit: f64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct TradeRecord {
+    pair: String,
+    entry_price: f64,
+    exit_price: f64,
+    size: f64,
+    pnl: f64,
+    open_ts: i64,
+    close_ts: i64,
+    reason: String,
+}
+
 #[derive(Debug)]
 struct TraderState {
     initial_balance: f64,
@@ -399,6 +523,8 @@ struct TraderState {
     max_positions: usize,
     positions: HashMap<String, Position>,
     realized_pnl: f64,
+    trade_history: Vec<TradeRecord>,
+    equity_curve: Vec<(i64, f64)>,
 }
 
 impl TraderState {
@@ -410,6 +536,20 @@ impl TraderState {
             max_positions: VIRTUAL_MAX_POSITIONS,
             positions: HashMap::new(),
             realized_pnl: 0.0,
+            trade_history: Vec::new(),
+            equity_curve: vec![(chrono::Utc::now().timestamp(), VIRTUAL_INITIAL_BALANCE)],
+        }
+    }
+
+    fn add_trade_record(&mut self, record: TradeRecord) {
+        self.trade_history.push(record);
+        if self.trade_history.len() > 1000 {
+            self.trade_history.remove(0);
+        }
+        let now = chrono::Utc::now().timestamp();
+        self.equity_curve.push((now, self.balance));
+        if self.equity_curve.len() > 365 {
+            self.equity_curve.remove(0);
         }
     }
 }
@@ -435,6 +575,16 @@ struct PositionsResponse {
     positions: Vec<PositionView>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct PaperPortfolioResponse {
+    balance: f64,
+    realized_pnl: f64,
+    unrealized_pnl: f64,
+    positions: usize,
+    total_trades: usize,
+    winrate: f64,
+}
+
 // ============================================================================
 // HOOFDSTUK 6 – ENGINE (HART VAN HET SYSTEEM)
 // ============================================================================
@@ -445,6 +595,7 @@ struct Engine {
 trades: Arc<DashMap<String, TradeState>>,
     candles: Arc<DashMap<String, CandleState>>,
     tickers: Arc<DashMap<String, TickerState>>,
+    orderbooks: Arc<DashMap<String, OrderbookState>>,
     signals: Arc<Mutex<Vec<SignalEvent>>>,
     signalled_pairs: Arc<DashMap<String, bool>>,
     weights: Arc<Mutex<ScoreWeights>>,
@@ -458,6 +609,7 @@ impl Engine {
             trades: Arc::new(DashMap::new()),
             candles: Arc::new(DashMap::new()),
             tickers: Arc::new(DashMap::new()),
+            orderbooks: Arc::new(DashMap::new()),
             signals: Arc::new(Mutex::new(Vec::new())),
             signalled_pairs: Arc::new(DashMap::new()),
             weights: Arc::new(Mutex::new(ScoreWeights::default())),
@@ -477,6 +629,20 @@ impl Engine {
         if buf.len() > 400 {
             let overflow = buf.len() - 400;
             buf.drain(0..overflow);
+        }
+    }
+
+    // NIEUW: update_sentiment functie voor nieuws-integratie (stap 1)
+    fn update_sentiment(&self, pair: &str, sentiment: f64) {
+        if let Some(mut ts) = self.trades.get_mut(pair) {
+            ts.news_sentiment = sentiment;
+            ts.last_update_ts = Utc::now().timestamp();  // FIX: Update timestamp zodat UI echte data toont
+            // Boost scores: Bij positief sentiment, verhoog anomaly_score
+            if sentiment > 0.7 {
+                ts.last_score *= 1.1;  // 10% boost
+            } else if sentiment < 0.3 {
+                ts.last_score *= 0.95;  // Lichte penalty voor negatief
+            }
         }
     }
 
@@ -699,6 +865,44 @@ impl Engine {
             }
         }
 
+        // -------------------- Orderbook analysis --------------------
+        // Adjust whale_score based on orderbook walls (buy/sell pressure)
+        if let Some(ob) = self.orderbooks.get(pair) {
+            let age = ts_int.saturating_sub(ob.timestamp);
+            // Only use recent orderbook data (within 10 seconds)
+            if age >= 0 && age <= 10 {
+                // Calculate total volume in top bids and asks
+                let bid_volume: f64 = ob.bids.iter().take(10).map(|(_, v)| v).sum();
+                let ask_volume: f64 = ob.asks.iter().take(10).map(|(_, v)| v).sum();
+                let total_volume = bid_volume + ask_volume;
+
+                if total_volume > 0.0 {
+                    let bid_ratio = bid_volume / total_volume;
+                    
+                    // If there's a large buy wall (high bid volume) and we're seeing buy trades
+                    if side == "b" && bid_ratio > 0.65 {
+                        whale_score += 0.5; // Boost score for buy pressure
+                    }
+                    // If there's a large sell wall (high ask volume) and we're seeing sell trades
+                    else if side == "s" && bid_ratio < 0.35 {
+                        whale_score += 0.5; // Boost score for sell pressure
+                    }
+
+                    // Additional boost for extreme imbalances
+                    if bid_ratio > 0.75 && side == "b" {
+                        whale_score += 0.3;
+                    } else if bid_ratio < 0.25 && side == "s" {
+                        whale_score += 0.3;
+                    }
+                }
+            }
+        }
+
+        // Clamp whale_score to reasonable range
+        if whale_score > 4.0 {
+            whale_score = 4.0;
+        }
+
         let mut volume_score = 0.0;
         let vol_ratio = if v1 > 0.0 { volume / v1 } else { 1.0 };
         if vol_ratio > 2.5 {
@@ -872,6 +1076,22 @@ impl Engine {
         // Volume nog niet extreem -> nog in opbouwfase
         if vol_ratio < 1.3 {
             whale_pred_score += 0.5;
+        }
+
+        // Orderbook integration for whale prediction
+        if let Some(ob) = self.orderbooks.get(pair) {
+            let age = ts_int.saturating_sub(ob.timestamp);
+            if age >= 0 && age <= 10 {
+                let bid_volume: f64 = ob.bids.iter().take(10).map(|(_, v)| v).sum();
+                let ask_volume: f64 = ob.asks.iter().take(10).map(|(_, v)| v).sum();
+                let total_volume = bid_volume + ask_volume;
+                if total_volume > 0.0 {
+                    let bid_ratio = bid_volume / total_volume;
+                    if bid_ratio > 0.65 {
+                        whale_pred_score += (bid_ratio - 0.65) * 2.0;
+                    }
+                }
+            }
         }
 
         if whale_pred_score < 0.0 {
@@ -1193,17 +1413,17 @@ impl Engine {
         let cutoff_300 = now_f - 300.0;
 
         let mut recent_trades_60: usize = 0;
-        let mut vol_60: f64 = 0.0;
-        for (ts, v) in t.recent_buys.iter().chain(t.recent_sells.iter()) {
-            if *ts >= cutoff_60 {
+        let _vol_60: f64 = 0.0; // Fix unused variable
+        for (_ts, _v) in t.recent_buys.iter().chain(t.recent_sells.iter()) {
+            if *_ts >= cutoff_60 {
                 recent_trades_60 += 1;
-                vol_60 += *v;
+                // _vol_60 += *v; // Unused, so commented
             }
         }
 
         let mut vol_300: f64 = 0.0;
-        for (ts, v) in t.recent_buys_5m.iter().chain(t.recent_sells_5m.iter()) {
-            if *ts >= cutoff_300 {
+        for (_ts, v) in t.recent_buys_5m.iter().chain(t.recent_sells_5m.iter()) {
+            if *_ts >= cutoff_300 {
                 vol_300 += *v;
             }
         }
@@ -1226,13 +1446,13 @@ impl Engine {
         // 3) Flow consistency (0–20): hoge BUY/SELL-dominantie mét volume
         let mut buys_60: f64 = 0.0;
         let mut sells_60: f64 = 0.0;
-        for (ts, v) in t.recent_buys.iter() {
-            if *ts >= cutoff_60 {
+        for (_ts, v) in t.recent_buys.iter() {
+            if *_ts >= cutoff_60 {
                 buys_60 += *v;
             }
         }
-        for (ts, v) in t.recent_sells.iter() {
-            if *ts >= cutoff_60 {
+        for (_ts, v) in t.recent_sells.iter() {
+            if *_ts >= cutoff_60 {
                 sells_60 += *v;
             }
         }
@@ -1413,6 +1633,7 @@ fn snapshot(&self) -> Vec<Row> {
                     .get(&r.pair)
                     .map(|t| t.last_update_ts)
                     .unwrap_or(0),
+                reliability_score: r.reliability_score,  // TOEGEVOEGD: REL voor heatmap
             })
             .collect()
     }
@@ -1451,8 +1672,8 @@ fn snapshot(&self) -> Vec<Row> {
             let mut loss_sum = 0.0_f64;
             let mut pnl_sum = 0.0_f64;
 
-            let mut best_trade = f64::MIN;
-            let mut worst_trade = f64::MAX;
+            let best_trade = f64::MIN; // Fix mut
+            let worst_trade = f64::MAX;
 
             let mut losing_streak = 0usize;
             let mut max_losing_streak = 0usize;
@@ -1470,13 +1691,6 @@ fn snapshot(&self) -> Vec<Row> {
                 let dd = peak - cum;
                 if dd > max_dd {
                     max_dd = dd;
-                }
-
-                if r > best_trade {
-                    best_trade = r;
-                }
-                if r < worst_trade {
-                    worst_trade = r;
                 }
 
                 if r > 0.0 {
@@ -1540,89 +1754,6 @@ fn snapshot(&self) -> Vec<Row> {
         out
     }
 
-    // ---------- TRADE ADVICE SNAPSHOT ----------
-    fn trade_advice_snapshot(&self) -> TradeAdviceResponse {
-        // Gebruik de huidige snapshot, gefilterd op de top van de scores
-        let rows = self.snapshot();
-
-        let mut advice_rows: Vec<TradeAdviceRow> = Vec::new();
-
-        let mut total_entry = 0.0_f64;
-        let mut total_exit_5 = 0.0_f64;
-        let mut total_exit_10 = 0.0_f64;
-        let mut total_exit_15 = 0.0_f64;
-        let mut total_exit_20 = 0.0_f64;
-
-        // Neem b.v. top 10 rows als advies-universum
-        for r in rows.iter().take(10) {
-            if r.price <= 0.0 {
-                continue;
-            }
-
-            // Flow-score benadering zoals in handle_trade, maar alleen op basis van flow_pct
-            let mut flow_score_for_entry = 0.0;
-            if r.flow_pct > 75.0 {
-                flow_score_for_entry = 3.0;
-            } else if r.flow_pct > 65.0 {
-                flow_score_for_entry = 2.0;
-            } else if r.flow_pct > 55.0 {
-                flow_score_for_entry = 1.0;
-            }
-
-            let pump_score = r.pump_score.max(0.0);
-            let whale_pred_score = r.whale_pred_score.max(0.0);
-
-            // OPTIE 3 — Entry = weighted model van totale score
-            // entry = current_price - (
-            //      0.001 * flow_score
-            //    + 0.001 * pump_score
-            //    + 0.002 * whale_pred_score
-            // )
-            let mut entry_price = r.price
-                - (0.001 * flow_score_for_entry
-                    + 0.001 * pump_score
-                    + 0.002 * whale_pred_score);
-
-            if entry_price <= 0.0 {
-                entry_price = r.price * 0.995; // fallback
-            }
-
-            let exit_5 = entry_price * 1.05;
-            let exit_10 = entry_price * 1.10;
-            let exit_15 = entry_price * 1.15;
-            let exit_20 = entry_price * 1.20;
-
-            total_entry += entry_price;
-            total_exit_5 += exit_5;
-            total_exit_10 += exit_10;
-            total_exit_15 += exit_15;
-            total_exit_20 += exit_20;
-
-            advice_rows.push(TradeAdviceRow {
-                pair: r.pair.clone(),
-                price: r.price,
-                entry_price,
-                exit_5,
-                exit_10,
-                exit_15,
-                exit_20,
-            });
-        }
-
-        let equity = TradeAdviceEquity {
-            equity_5: total_exit_5,
-            equity_10: total_exit_10,
-            equity_15: total_exit_15,
-            equity_20: total_exit_20,
-        };
-
-        TradeAdviceResponse {
-            rows: advice_rows,
-            equity,
-        }
-    }
-
-
     fn maybe_open_position_from_signal(&self, ev: &SignalEvent) {
         if ev.direction != "BUY" {
             return;
@@ -1668,6 +1799,17 @@ fn snapshot(&self) -> Vec<Row> {
                 let pnl = (price - pos.entry_price) * pos.size;
                 trader.balance += pnl;
                 trader.realized_pnl += pnl;
+                let record = TradeRecord {
+                    pair: pair.to_string(),
+                    entry_price: pos.entry_price,
+                    exit_price: price,
+                    size: pos.size,
+                    pnl,
+                    open_ts: pos.open_ts,
+                    close_ts: chrono::Utc::now().timestamp(),
+                    reason: if hit_tp { "TP" } else { "SL" }.to_string(),
+                };
+                trader.add_trade_record(record);
                 trader.positions.remove(pair);
                 println!(
                     "[TRADER] CLOSE LONG {} at {:.5} (entry {:.5}, size {:.5}) PnL={:.4}{}",
@@ -1722,45 +1864,83 @@ fn snapshot(&self) -> Vec<Row> {
     fn build_analysis(row: &Row) -> String {
         let mut parts: Vec<String> = Vec::new();
 
-        if row.pct > 15.0 {
-            parts.push("Zeer sterke stijging (>15%).".to_string());
-        } else if row.pct > 5.0 {
-            parts.push("Gezonde opwaartse move (>5%).".to_string());
-        } else if row.pct < -5.0 {
-            parts.push("Duidelijke neerwaartse move (<-5%).".to_string());
-        } else if row.pct < -2.0 {
-            parts.push("Lichte downtrend.".to_string());
-        } else if row.pct > 0.0 {
-            parts.push("Lichte uptrend.".to_string());
-        }
-
-        if row.flow_pct > 75.0 && row.dir == "BUY" {
-            parts.push("Kopers domineren (>75% buy-flow).".to_string());
-        } else if row.flow_pct > 60.0 && row.dir == "BUY" {
-            parts.push("Kopers domineren (>60% buy-flow).".to_string());
-        } else if row.flow_pct > 60.0 && row.dir == "SELL" {
-            parts.push("Verkopers domineren (>60% sell-flow).".to_string());
-        }
-
-        if row.alpha == "BUY" {
-            parts.push("Alpha BUY: sterke combinatie van trend + anomaly.".to_string());
-        }
-
-        if row.whale_pred_label == "HIGH" {
-            parts.push("Hoge kans op aankomende whale-activiteit.".to_string());
-        } else if row.whale_pred_label == "MEDIUM" {
-            parts.push("Verhoogde kans op whale-accumulatie.".to_string());
-        }
-
-        if parts.is_empty() {
-            "Lichte downtrend.".to_string()
+        // Prijsbeweging
+        if row.pct > 5.0 {
+            parts.push(format!("Prijs is gestegen met {:.1}%.", row.pct));
+        } else if row.pct > 1.0 {
+            parts.push(format!("Lichte prijsstijging van {:.1}%.", row.pct));
+        } else if row.pct < -1.0 {
+            parts.push(format!("Prijs is gedaald met {:.1}%.", row.pct.abs()));
         } else {
-            parts.join(" ")
+            parts.push("Prijs beweegt zijwaarts.".to_string());
         }
+
+        // Flow en richting
+        if row.flow_pct > 70.0 && row.dir == "BUY" {
+            parts.push(format!("Sterke koopdruk: {:.0}% buy-flow.", row.flow_pct));
+        } else if row.flow_pct > 60.0 && row.dir == "BUY" {
+            parts.push(format!("Matige koopdruk: {:.0}% buy-flow.", row.flow_pct));
+        } else if row.flow_pct > 60.0 && row.dir == "SELL" {
+            parts.push(format!("Verkoopdruk: {:.0}% sell-flow.", row.flow_pct));
+        } else {
+            parts.push("Neutrale markt flow.".to_string());
+        }
+
+        // Whale activiteit
+        if row.whale {
+            let whale_vol = row.whale_volume;
+            let whale_not = row.whale_notional / 1000.0;
+            parts.push(format!("Whale-trade gedetecteerd: {:.2} eenheden, €{:.0}k notional.", whale_vol, whale_not));
+        }
+
+        // Pump score
+        if row.pump_score > 5.0 {
+            parts.push(format!("Pump-score van {:.1} duidt op mogelijke accumulatie.", row.pump_score));
+        } else if row.pump_score > 2.0 {
+            parts.push(format!("Matige pump-score van {:.1}.", row.pump_score));
+        }
+
+        // Whale prediction
+        if row.whale_pred_label == "HIGH" {
+            parts.push(format!("Hoge kans op whale-activiteit (score {:.1}).", row.whale_pred_score));
+        } else if row.whale_pred_label == "MEDIUM" {
+            parts.push(format!("Matige kans op whales (score {:.1}).", row.whale_pred_score));
+        }
+
+        // Reliability
+        if row.reliability_label == "HIGH" {
+            parts.push(format!("Betrouwbaarheid hoog ({:.0}).", row.reliability_score));
+        } else if row.reliability_label == "LOW" {
+            parts.push(format!("Betrouwbaarheid laag ({:.0}) - let op.", row.reliability_score));
+        }
+
+        // Alpha signalen
+        if row.alpha == "BUY" {
+            parts.push("Alpha BUY signaal: sterke combinatie van factoren.".to_string());
+        } else if row.early == "BUY" {
+            parts.push("Vroege koopindicatie.".to_string());
+        }
+
+        // Als geen specifieke info, algemene opmerking
+        if parts.is_empty() {
+            parts.push("Neutrale marktcondities.".to_string());
+        }
+
+        // Combineer tot één string
+        parts.join(" ")
+
+        // Beperk lengte tot ~200 karakters voor leesbaarheid
+        .chars().take(200).collect::<String>()
     }
 
     fn top10_snapshot(&self) -> Top10Response {
         let rows = self.snapshot();
+
+        // Helper functie om laatste signal_type te vinden
+        let get_last_signal_type = |pair: &str| -> String {
+            let signals = self.signals.lock().unwrap();
+            signals.iter().rev().find(|s| s.pair == pair).map(|s| s.signal_type.clone()).unwrap_or_else(|| "NONE".to_string())
+        };
 
         // stijgers
         let mut risers: Vec<TopRow> = rows
@@ -1791,6 +1971,7 @@ fn snapshot(&self) -> Vec<Row> {
                 whale_pred_label: r.whale_pred_label.clone(),
                 reliability_score: r.reliability_score,
                 reliability_label: r.reliability_label.clone(),
+                signal_type: get_last_signal_type(&r.pair),
             })
             .collect();
 
@@ -1853,7 +2034,7 @@ fn snapshot(&self) -> Vec<Row> {
                     whale_pred_label: r.whale_pred_label.clone(),
 	            reliability_score: r.reliability_score,
 		    reliability_label: r.reliability_label.clone(),
-
+                    signal_type: get_last_signal_type(&r.pair),
                 }
             })
             .collect();
@@ -1980,21 +2161,34 @@ tr:nth-child(even){ background:#252525; }
     <button class="tab-btn active" data-tab="markets">Markets</button>
     <button class="tab-btn" data-tab="signals">Signals</button>
     <button class="tab-btn" data-tab="top10">Top 10</button>
-    <button class="tab-btn" data-tab="trade_advice">Trade Advice</button>
+    <button class="tab-btn" data-tab="paper_trading">Paper Trading</button>
     <button class="tab-btn" data-tab="backtest">Backtest</button>
     <button class="tab-btn" data-tab="heatmap">Heatmap</button>
+    <button class="tab-btn" data-tab="stars">Stars</button>
+    <button class="tab-btn" data-tab="news">News</button>
+    <button class="tab-btn" data-tab="config">Config</button>
     <button class="tab-btn" data-tab="guide">Guide</button>
   </div>
 </header>
 <main style="padding:0 8px 8px 8px;">
   <div id="view-markets">
+    <div style="margin-bottom:10px;">
+      <label for="markets-dir-filter">Filter op DIR:</label>
+      <select id="markets-dir-filter">
+        <option value="ALL">ALL</option>
+        <option value="BUY">BUY</option>
+        <option value="SELL">SELL</option>
+      </select>
+      <label for="markets-stable-filter" style="margin-left:10px;">Include Stablecoins:</label>
+      <input type="checkbox" id="markets-stable-filter" checked />
+    </div>
     <table id="grid">
       <thead>
         <tr>
           <th>Pair</th><th>Price</th><th>%</th><th>Whale</th>
           <th>Flow</th><th>Dir</th><th>Early</th><th>Alpha</th><th>Pump</th>
-          <th>WhPred</th><th>Rel</th>
-          <th>Trades</th><th>Buys</th><th>Sells</th>
+          <th>WhPred</th><th>Rel</th><th>News Sent.</th>
+          <th>Total score</th><th>Trades</th><th>Buys</th><th>Sells</th>
           <th>O</th><th>H</th><th>L</th><th>C</th>
           <th>Visual</th>
         </tr>
@@ -2004,11 +2198,21 @@ tr:nth-child(even){ background:#252525; }
   </div>
 
   <div id="view-signals" style="display:none;">
+    <div style="margin-bottom:10px;">
+      <label for="signals-dir-filter">Filter op DIR:</label>
+      <select id="signals-dir-filter">
+        <option value="ALL">ALL</option>
+        <option value="BUY">BUY</option>
+        <option value="SELL">SELL</option>
+      </select>
+      <label for="signals-stable-filter" style="margin-left:10px;">Include Stablecoins:</label>
+      <input type="checkbox" id="signals-stable-filter" checked />
+    </div>
     <table id="signals">
       <thead>
         <tr>
           <th>Time (ts)</th><th>Pair</th><th>Type</th><th>Dir</th>
-          <th>Strength</th><th>Flow</th><th>%</th>
+          <th>Strength</th><th>Flow</th><th>%</th><th>Total score</th>
           <th>Whale</th><th>Vol</th><th>Notional</th><th>Price</th><th>Pump</th>
           <th>Visual</th>
         </tr>
@@ -2018,14 +2222,23 @@ tr:nth-child(even){ background:#252525; }
   </div>
 
   <div id="view-top10" style="display:none;">
+    <div style="margin-bottom:10px;">
+      <label for="top10-dir-filter">Filter op DIR:</label>
+      <select id="top10-dir-filter">
+        <option value="ALL">ALL</option>
+        <option value="BUY">BUY</option>
+        <option value="SELL">SELL</option>
+      </select>
+      <label for="top10-stable-filter" style="margin-left:10px;">Include Stablecoins:</label>
+      <input type="checkbox" id="top10-stable-filter" checked />
+    </div>
     <h2>🔥 Best 3 Right Now</h2>
     <table id="top3">
       <thead>
         <tr>
           <th>Time</th><th>Pair</th><th>Price</th><th>%</th><th>Flow</th><th>Dir</th>
           <th>Early</th><th>Alpha</th><th>Whale</th><th>Total score</th><th>Pump</th>
-          <th>WhPred</th>
-          <th>Visual</th><th>Analyse</th>
+          <th>WhPred</th><th>Rel</th><th>Type</th><th>Visual</th><th>Analyse</th>
         </tr>
       </thead>
       <tbody></tbody>
@@ -2037,8 +2250,7 @@ tr:nth-child(even){ background:#252525; }
         <tr>
           <th>Time</th><th>Pair</th><th>Price</th><th>%</th><th>Flow</th><th>Dir</th>
           <th>Early</th><th>Alpha</th><th>Whale</th><th>Total score</th><th>Pump</th>
-          <th>WhPred</th>
-          <th>Visual</th><th>Analyse</th>
+          <th>WhPred</th><th>Rel</th><th>Type</th><th>Visual</th><th>Analyse</th>
         </tr>
       </thead>
       <tbody></tbody>
@@ -2050,51 +2262,36 @@ tr:nth-child(even){ background:#252525; }
         <tr>
           <th>Time</th><th>Pair</th><th>Price</th><th>%</th><th>Flow</th><th>Dir</th>
           <th>Early</th><th>Alpha</th><th>Whale</th><th>Total score</th><th>Pump</th>
-          <th>WhPred</th>
-          <th>Visual</th><th>Analyse</th>
+          <th>WhPred</th><th>Rel</th><th>Type</th><th>Visual</th><th>Analyse</th>
         </tr>
       </thead>
       <tbody></tbody>
     </table>
   </div>
 
-  <div id="view-trade_advice" style="display:none;">
-    <h2>Trade Advice</h2>
-    <p style="font-size:12px;">
-      Entry prijs wordt live bepaald op basis van flow, pump en whale prediction (optie 3).
-      Scenario's tonen mogelijke exits bij +5%, +10%, +15%, +20% vanaf entry.
-    </p>
-    <table id="trade-advice-table">
+  <div id="view-paper_trading" style="display:none;">
+    <div style="margin-bottom:10px;">
+      <label for="paper-stable-filter">Include Stablecoins:</label>
+      <input type="checkbox" id="paper-stable-filter" checked />
+    </div>
+    <h2>Paper Trading Portfolio</h2>
+    <div id="portfolio-summary"></div>
+    <h3>Equity Curve</h3>
+    <canvas id="paper-equity" width="900" height="260" style="border:1px solid #333; background:#111;"></canvas>
+    <h3>Trade History</h3>
+    <table id="paper-history">
       <thead>
-        <tr>
-          <th>Munt</th>
-          <th>Koers</th>
-          <th>Entry</th>
-          <th>Exit +5%</th>
-          <th>Exit +10%</th>
-          <th>Exit +15%</th>
-          <th>Exit +20%</th>
-        </tr>
+        <tr><th>Pair</th><th>Entry</th><th>Exit</th><th>Size</th><th>PnL</th><th>Reason</th><th>Duration (min)</th></tr>
       </thead>
       <tbody></tbody>
-    </table>
-
-    <h3>Equity per scenario (1 unit per entry)</h3>
-    <table>
-      <thead>
-        <tr>
-          <th>Equity bij +5%</th>
-          <th>Equity bij +10%</th>
-          <th>Equity bij +15%</th>
-          <th>Equity bij +20%</th>
-        </tr>
-      </thead>
-      <tbody id="trade-advice-equity">
-      </tbody>
     </table>
   </div>
 
   <div id="view-backtest" style="display:none;">
+    <div style="margin-bottom:10px;">
+      <label for="backtest-stable-filter">Include Stablecoins:</label>
+      <input type="checkbox" id="backtest-stable-filter" checked />
+    </div>
     <h2>Backtest per signaaltype</h2>
     <p style="font-size:12px;">
       Gebaseerd op afgeronde signals (ongeveer 5 minuten na het signaal).
@@ -2131,6 +2328,10 @@ tr:nth-child(even){ background:#252525; }
   </div>
 
   <div id="view-heatmap" style="display:none;">
+    <div style="margin-bottom:10px;">
+      <label for="heatmap-stable-filter">Include Stablecoins:</label>
+      <input type="checkbox" id="heatmap-stable-filter" checked />
+    </div>
     <h2>Heatmap: BUY-flow vs Pump-score</h2>
     <canvas id="heatCanvas" width="800" height="400" style="border:0;"></canvas>
     <div style="margin-top:8px; font-size:12px;">
@@ -2144,6 +2345,131 @@ tr:nth-child(even){ background:#252525; }
     </div>
   </div>
 
+  <div id="view-stars" style="display:none;">
+    <div style="margin-bottom:10px;">
+      <label for="stars-stable-filter">Include Stablecoins:</label>
+      <input type="checkbox" id="stars-stable-filter" checked />
+    </div>
+    <h2>⭐ Stars: ANOM & WH_PRED HIGH (last 5 hours)</h2>
+    <table id="stars-table">
+      <thead>
+        <tr>
+          <th>Time</th><th>Pair</th><th>Price</th><th>%</th><th>Flow</th><th>Dir</th>
+          <th>Early</th><th>Alpha</th><th>Whale</th><th>Total score</th><th>Pump</th>
+          <th>WhPred</th><th>Rel</th><th>Type</th><th>Visual</th><th>Analyse</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <div id="view-news" style="display:none;">
+    <div style="margin-bottom:10px;">
+      <label for="news-stable-filter">Include Stablecoins:</label>
+      <input type="checkbox" id="news-stable-filter" checked />
+    </div>
+    <h2>📰 News Sentiment</h2>
+    <table id="news-table">
+      <thead>
+        <tr>
+          <th>Pair</th><th>Sentiment</th><th>Last Update</th><th>Articles</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <div id="view-config" style="display:none;">
+    <h2>Configuration Settings</h2>
+    <form id="config-form">
+      <h3>1. Signal Drempels</h3>
+      <label>Pump Confidence Threshold (0.0-1.0):</label>
+      <input type="number" step="0.1" min="0.0" max="1.0" id="pump_conf_threshold" /><br/>
+      <label>Whale Prediction High Threshold (0.0-10.0):</label>
+      <input type="number" step="0.1" min="0.0" max="10.0" id="whale_pred_high_threshold" /><br/>
+      <label>Early Buy Threshold (0.0-5.0):</label>
+      <input type="number" step="0.1" min="0.0" max="5.0" id="early_buy_threshold" /><br/>
+      <label>Alpha Buy Threshold (0.0-10.0):</label>
+      <input type="number" step="0.1" min="0.0" max="10.0" id="alpha_buy_threshold" /><br/>
+      <label>Strong Buy Threshold (0.0-10.0):</label>
+      <input type="number" step="0.1" min="0.0" max="10.0" id="strong_buy_threshold" /><br/>
+      <label>Whale Min Notional (0.0-10000.0):</label>
+      <input type="number" step="100" min="0.0" max="10000.0" id="whale_min_notional" /><br/>
+      <label>Anomaly Strength Threshold (0.0-100.0):</label>
+      <input type="number" step="1" min="0.0" max="100.0" id="anomaly_strength_threshold" /><br/>
+
+      <h3>2. Score Gewichten</h3>
+      <label>Flow Weight (0.0-5.0):</label>
+      <input type="number" step="0.1" min="0.0" max="5.0" id="flow_weight" /><br/>
+      <label>Price Weight (0.0-5.0):</label>
+      <input type="number" step="0.1" min="0.0" max="5.0" id="price_weight" /><br/>
+      <label>Whale Weight (0.0-5.0):</label>
+      <input type="number" step="0.1" min="0.0" max="5.0" id="whale_weight" /><br/>
+      <label>Volume Weight (0.0-5.0):</label>
+      <input type="number" step="0.1" min="0.0" max="5.0" id="volume_weight" /><br/>
+      <label>Anomaly Weight (0.0-5.0):</label>
+      <input type="number" step="0.1" min="0.0" max="5.0" id="anomaly_weight" /><br/>
+      <label>Trend Weight (0.0-5.0):</label>
+      <input type="number" step="0.1" min="0.0" max="5.0" id="trend_weight" /><br/>
+
+      <h3>3. Paper Trading Instellingen</h3>
+      <label>Initial Balance (1000.0-100000.0):</label>
+      <input type="number" step="1000" min="1000.0" max="100000.0" id="initial_balance" /><br/>
+      <label>Base Notional (10.0-1000.0):</label>
+      <input type="number" step="10" min="10.0" max="1000.0" id="base_notional" /><br/>
+      <label>Stop Loss Percentage (0.01-0.1):</label>
+      <input type="number" step="0.01" min="0.01" max="0.1" id="sl_pct" /><br/>
+      <label>Take Profit Percentage (0.01-0.1):</label>
+      <input type="number" step="0.01" min="0.01" max="0.1" id="tp_pct" /><br/>
+      <label>Max Positions (1-10):</label>
+      <input type="number" step="1" min="1" max="10" id="max_positions" /><br/>
+      <label>Enable Trading:</label>
+      <input type="checkbox" id="enable_trading" /><br/>
+
+      <h3>4. Engine & Data Instellingen</h3>
+      <label>WS Workers per Chunk (10-50):</label>
+      <input type="number" step="5" min="10" max="50" id="ws_workers_per_chunk" /><br/>
+      <label>REST Scan Interval (10-60):</label>
+      <input type="number" step="5" min="10" max="60" id="rest_scan_interval_sec" /><br/>
+      <label>Cleanup Interval (300-1200):</label>
+      <input type="number" step="100" min="300" max="1200" id="cleanup_interval_sec" /><br/>
+      <label>Eval Horizon (60-600):</label>
+      <input type="number" step="60" min="60" max="600" id="eval_horizon_sec" /><br/>
+      <label>Max History (200-1000):</label>
+      <input type="number" step="100" min="200" max="1000" id="max_history" /><br/>
+
+      <h3>5. UI & Filter Instellingen</h3>
+      <label>Default DIR Filter:</label>
+      <select id="default_dir_filter">
+        <option value="ALL">ALL</option>
+        <option value="BUY">BUY</option>
+        <option value="SELL">SELL</option>
+      </select><br/>
+      <label>Include Stablecoins Default:</label>
+      <input type="checkbox" id="include_stablecoins_default" /><br/>
+      <label>Heatmap Min Radius (4.0-10.0):</label>
+      <input type="number" step="0.5" min="4.0" max="10.0" id="heatmap_min_radius" /><br/>
+      <label>Heatmap Max Radius (10.0-20.0):</label>
+      <input type="number" step="0.5" min="10.0" max="20.0" id="heatmap_max_radius" /><br/>
+      <label>Chart Refresh Rate (0.5-5.0):</label>
+      <input type="number" step="0.5" min="0.5" max="5.0" id="chart_refresh_rate_sec" /><br/>
+
+      <h3>6. AI & Self-Learning Instellingen</h3>
+      <label>Success Threshold (0.5-1.0):</label>
+      <input type="number" step="0.05" min="0.5" max="1.0" id="ai_success_threshold" /><br/>
+      <label>Adjustment Step Up (1.0-2.0):</label>
+      <input type="number" step="0.01" min="1.0" max="2.0" id="ai_adjustment_step_up" /><br/>
+      <label>Adjustment Step Down (0.5-1.0):</label>
+      <input type="number" step="0.01" min="0.5" max="1.0" id="ai_adjustment_step_down" /><br/>
+      <label>Max Weight (3.0-10.0):</label>
+      <input type="number" step="0.5" min="3.0" max="10.0" id="ai_max_weight" /><br/>
+
+      <button type="button" id="save-config">Save Config</button>
+      <button type="button" id="reset-config">Reset to Defaults</button>
+    </form>
+    <div id="config-status"></div>
+  </div>
+
   <div id="view-guide" style="display:none;">
     <div id="guide">
       <h2>Kolommen uitleg</h2>
@@ -2154,16 +2480,25 @@ tr:nth-child(even){ background:#252525; }
         <li><b>Alpha</b>: sterkste combinatie van trend, volume, whales en anomalies (alleen bij BUY).</li>
         <li><b>Pump</b>: gecombineerde score van korte en middellange termijn prijsimpuls + flow.</li>
         <li><b>WhPred</b>: kans op aankomende whale (LOW / MEDIUM / HIGH).</li>
+        <li><b>News Sent.</b>: sentiment van recente nieuwsartikelen (0-1).</li>
         <li><b>Visual</b>: link naar de bijbehorende Kraken Pro grafiek.</li>
       </ul>
     </div>
   </div>
 </main>
 <script>
+// ... bestaande JS ...
 let activeTab = "markets";
 
 let heatmapPoints = [];
 let heatTooltip = null;
+
+const stablecoins = ["USDT", "USDC", "TUSD", "BUSD", "DAI", "UST", "FRAX", "LUSD"];
+
+function isStablecoin(pair) {
+  const base = pair.split('/')[0];
+  return stablecoins.includes(base);
+}
 
 function ensureHeatTooltip() {
   if (heatTooltip) return;
@@ -2180,6 +2515,24 @@ function ensureHeatTooltip() {
   document.body.appendChild(heatTooltip);
 }
 
+// Filter functie voor DIR
+function applyDirFilter(tableId, filterSelectId) {
+  const filterValue = document.getElementById(filterSelectId).value;
+  const tbody = document.querySelector(`#${tableId} tbody`);
+  const rows = tbody.querySelectorAll('tr');
+  rows.forEach(row => {
+    const dirCell = row.cells[5]; // Assuming DIR is the 6th column (index 5)
+    if (dirCell) {
+      const dirText = dirCell.textContent.trim();
+      if (filterValue === 'ALL' || dirText === filterValue) {
+        row.style.display = '';
+      } else {
+        row.style.display = 'none';
+      }
+    }
+  });
+}
+
 function switchTab(tab) {
   activeTab = tab;
   document.getElementById("view-markets").style.display =
@@ -2188,25 +2541,33 @@ function switchTab(tab) {
     tab === "signals" ? "block" : "none";
   document.getElementById("view-top10").style.display =
     tab === "top10" ? "block" : "none";
-  document.getElementById("view-trade_advice").style.display =
-    tab === "trade_advice" ? "block" : "none";
+  document.getElementById("view-paper_trading").style.display =
+    tab === "paper_trading" ? "block" : "none";
   document.getElementById("view-backtest").style.display =
     tab === "backtest" ? "block" : "none";
   document.getElementById("view-heatmap").style.display =
     tab === "heatmap" ? "block" : "none";
+  document.getElementById("view-stars").style.display =
+    tab === "stars" ? "block" : "none";
+  document.getElementById("view-news").style.display =
+    tab === "news" ? "block" : "none";
+  document.getElementById("view-config").style.display =
+    tab === "config" ? "block" : "none";
   document.getElementById("view-guide").style.display =
     tab === "guide" ? "block" : "none";
-
-  document.querySelectorAll(".tab-btn").forEach(btn => {
-    btn.classList.toggle("active", btn.dataset.tab === tab);
-  });
 
   if (tab === "heatmap") {
     loadHeatmap();
   } else if (tab === "backtest") {
     loadBacktest();
-  } else if (tab === "trade_advice") {
-    loadTradeAdvice();
+  } else if (tab === "paper_trading") {
+    loadPaperTrading();
+  } else if (tab === "stars") {
+    loadStars();
+  } else if (tab === "news") {
+    loadNews();
+  } else if (tab === "config") {
+    loadConfig();
   }
 }
 
@@ -2223,16 +2584,15 @@ function buildVisualUrl(pair) {
 
 async function loadMarkets() {
   let q = document.getElementById("search").value.toLowerCase();
+  let includeStable = document.getElementById("markets-stable-filter").checked;
   let res = await fetch("/api/stats");
   let data = await res.json();
   let tbody = document.querySelector("#grid tbody");
   tbody.innerHTML = "";
 
   let filtered = data.filter(r =>
-    r.pair.toLowerCase().includes(q) ||
-    (r.whale && q === "whale") ||
-    (r.early && r.early.toLowerCase().includes(q)) ||
-    (r.alpha && r.alpha.toLowerCase().includes(q))
+    r.pair.toLowerCase().includes(q) &&
+    (includeStable || !isStablecoin(r.pair))
   );
 
   for (let r of filtered) {
@@ -2283,6 +2643,8 @@ async function loadMarkets() {
         "#ccc"}">${r.pump_score.toFixed(1)}</td>
       <td class="${predClass}">${r.whale_pred_label} (${r.whale_pred_score.toFixed(1)})</td>
       <td class="${relClass}">${r.reliability_label} (${r.reliability_score.toFixed(0)})</td>
+      <td>${r.news_sentiment ? r.news_sentiment.toFixed(2) : "0.50"}</td>
+      <td>${r.score.toFixed(2)}</td>
       <td>${r.trades}</td>
       <td>${r.buys.toFixed(4)}</td>
       <td>${r.sells.toFixed(4)}</td>
@@ -2295,15 +2657,19 @@ async function loadMarkets() {
 
     tbody.innerHTML += row;
   }
+  applyDirFilter('grid', 'markets-dir-filter');
 }
 
 async function loadSignals() {
+  let includeStable = document.getElementById("signals-stable-filter").checked;
   let res = await fetch("/api/signals");
   let data = await res.json();
   let tbody = document.querySelector("#signals tbody");
   tbody.innerHTML = "";
 
-  for (let r of data) {
+  let filtered = data.filter(r => includeStable || !isStablecoin(r.pair));
+
+  for (let r of filtered) {
     let typeClass = "signal_type signal_type_" + r.signal_type;
     let dirClass = "signal_dir_" + r.direction;
 
@@ -2329,6 +2695,7 @@ async function loadSignals() {
       <td>${r.strength.toFixed(3)}</td>
       <td>${r.flow_pct.toFixed(1)}%</td>
       <td>${r.pct.toFixed(2)}%</td>
+      <td>${r.total_score.toFixed(2)}</td>
       <td>${whaleTxt}</td>
       <td>${r.volume.toFixed(4)}</td>
       <td>${(r.notional/1000).toFixed(1)}k</td>
@@ -2339,9 +2706,11 @@ async function loadSignals() {
 
     tbody.innerHTML += row;
   }
+  applyDirFilter('signals', 'signals-dir-filter');
 }
 
 async function loadTop10() {
+  let includeStable = document.getElementById("top10-stable-filter").checked;
   let res = await fetch("/api/top10");
   let data = await res.json();
 
@@ -2372,6 +2741,12 @@ async function loadTop10() {
     else if (r.whale_pred_label === "MEDIUM") predClass = "pred_med";
     else if (r.whale_pred_label === "LOW") predClass = "pred_low";
 
+    let relClass = "";
+    if (r.reliability_label === "HIGH") relClass = "rel_high";
+    else if (r.reliability_label === "MEDIUM") relClass = "rel_med";
+    else if (r.reliability_label === "LOW") relClass = "rel_low";
+    else relClass = "rel_bad";
+
     return `<tr>
       <td>${fmtTime(r.ts)}</td>
       <td>${r.pair}</td>
@@ -2392,25 +2767,90 @@ async function loadTop10() {
         r.pump_label === "EARLY_PUMP" ? "#00bcd4" :
         "#ccc"}">${r.pump_score.toFixed(1)}</td>
       <td class="${predClass}">${r.whale_pred_label} (${r.whale_pred_score.toFixed(1)})</td>
+      <td class="${relClass}">${r.reliability_label} (${r.reliability_score.toFixed(0)})</td>
+      <td class="signal_type signal_type_${r.signal_type}">${r.signal_type}</td>
       <td>${visual}</td>
       <td>${r.analysis}</td>
     </tr>`;
   }
 
-  for (let r of data.best3) {
+  for (let r of data.best3.filter(row => includeStable || !isStablecoin(row.pair))) {
     top3Body.innerHTML += renderRow(r);
   }
 
-  for (let r of data.risers) {
+  for (let r of data.risers.filter(row => includeStable || !isStablecoin(row.pair))) {
     upBody.innerHTML += renderRow(r);
   }
 
-  for (let r of data.fallers) {
+  for (let r of data.fallers.filter(row => includeStable || !isStablecoin(row.pair))) {
     downBody.innerHTML += renderRow(r);
   }
+  applyDirFilter('top3', 'top10-dir-filter');
+  applyDirFilter('top10-up', 'top10-dir-filter');
+  applyDirFilter('top10-down', 'top10-dir-filter');
+}
+
+async function loadPaperTrading() {
+  let includeStable = document.getElementById("paper-stable-filter").checked;
+  // Portfolio overzicht
+  let portfolio = await fetch("/api/paper_portfolio").then(r => r.json());
+  document.getElementById("portfolio-summary").innerHTML = `
+    <p>Balance: €${portfolio.balance.toFixed(2)}</p>
+    <p>Realized PnL: €${portfolio.realized_pnl.toFixed(2)}</p>
+    <p>Unrealized PnL: €${portfolio.unrealized_pnl.toFixed(2)}</p>
+    <p>Positions: ${portfolio.positions}</p>
+    <p>Total Trades: ${portfolio.total_trades}</p>
+    <p>Winrate: ${portfolio.winrate.toFixed(1)}%</p>
+  `;
+
+  // Trade history tabel
+  let history = await fetch("/api/paper_history").then(r => r.json());
+  let tbody = document.querySelector("#paper-history tbody");
+  tbody.innerHTML = "";
+  history.filter(trade => includeStable || !isStablecoin(trade.pair)).forEach(trade => {
+    let duration = Math.round((trade.close_ts - trade.open_ts) / 60);
+    tbody.innerHTML += `<tr>
+      <td>${trade.pair}</td>
+      <td>${trade.entry_price.toFixed(4)}</td>
+      <td>${trade.exit_price.toFixed(4)}</td>
+      <td>${trade.size.toFixed(4)}</td>
+      <td class="${trade.pnl > 0 ? 'pos' : 'neg'}">€${trade.pnl.toFixed(2)}</td>
+      <td>${trade.reason}</td>
+      <td>${duration}</td>
+    </tr>`;
+  });
+
+  // Equity curve grafiek
+  let equity = await fetch("/api/paper_equity").then(r => r.json());
+  drawPaperEquity(equity);
+}
+
+function drawPaperEquity(equity) {
+  let canvas = document.getElementById("paper-equity");
+  let ctx = canvas.getContext("2d");
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  // Eenvoudige lijn (zoals backtest)
+  if (equity.length < 2) return;
+  let minY = Math.min(...equity.map(p => p[1]));
+  let maxY = Math.max(...equity.map(p => p[1]));
+  if (minY === maxY) minY -= 100;
+  let padding = 20;
+  let w = canvas.width - padding * 2;
+  let h = canvas.height - padding * 2;
+  ctx.strokeStyle = "#4caf50";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  equity.forEach((point, i) => {
+    let x = padding + (w * i) / (equity.length - 1);
+    let y = padding + h - ((point[1] - minY) / (maxY - minY)) * h;
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  });
+  ctx.stroke();
 }
 
 async function loadBacktest() {
+  let includeStable = document.getElementById("backtest-stable-filter").checked;
   try {
     let res = await fetch("/api/backtest");
     let data = await res.json();
@@ -2425,13 +2865,13 @@ async function loadBacktest() {
         <td>${r.direction}</td>
         <td>${r.total_trades}</td>
         <td>${r.winrate.toFixed(1)}%</td>
-        <td>${r.avg_win.toFixed(2)}%</td>
-        <td>${r.avg_loss.toFixed(2)}%</td>
+        <td>${r.avg_win.toFixed(2)}</td>
+        <td>${r.avg_loss.toFixed(2)}</td>
         <td>${r.expectancy.toFixed(2)}%</td>
         <td>${r.pnl_sum.toFixed(2)}%</td>
         <td>${r.max_drawdown.toFixed(2)}%</td>
-        <td>${r.best_trade.toFixed(2)}%</td>
-        <td>${r.worst_trade.toFixed(2)}%</td>
+        <td>${r.best_trade.toFixed(2)}</td>
+        <td>${r.worst_trade.toFixed(2)}</td>
         <td>${r.max_losing_streak}</td>
       `;
       tr.addEventListener("click", () => {
@@ -2551,6 +2991,7 @@ async function loadTradeAdvice() {
 }
 
 function loadHeatmap() {
+  let includeStable = document.getElementById("heatmap-stable-filter").checked;
   fetch("/api/heatmap")
     .then(r => r.json())
     .then(data => {
@@ -2599,7 +3040,7 @@ function loadHeatmap() {
 
       heatmapPoints = [];
 
-      for (let p of data) {
+      for (let p of data.filter(pt => includeStable || !isStablecoin(pt.pair))) {
         const x = x_to_px(p.flow_pct);
         const y = y_to_px(p.pump_score);
 
@@ -2610,10 +3051,21 @@ function loadHeatmap() {
           color = "#00bcd4";
         }
 
+        // REL-based radius and alpha
+        let min_rel = 0.0;
+        let max_rel = 100.0;
+        let rel_norm = (p.reliability_score - min_rel) / (max_rel - min_rel);
+        if (rel_norm < 0) rel_norm = 0;
+        if (rel_norm > 1) rel_norm = 1;
+        let radius = 4 + rel_norm * 8; // 4-12
+        let alpha = 0.3 + rel_norm * 0.7; // 0.3-1.0
+
         ctx.beginPath();
+        ctx.globalAlpha = alpha;
         ctx.fillStyle = color;
-        ctx.arc(x, y, 6, 0, Math.PI * 2);
+        ctx.arc(x, y, radius, 0, Math.PI * 2);
         ctx.fill();
+        ctx.globalAlpha = 1; // Reset
 
         heatmapPoints.push({
           x, y,
@@ -2621,11 +3073,132 @@ function loadHeatmap() {
           flow: p.flow_pct,
           pump: p.pump_score,
           ts: p.ts,
-          color
+          color,
+          rel: p.reliability_score,
         });
       }
     })
     .catch(err => console.error("heatmap error", err));
+}
+
+async function loadStars() {
+  let includeStable = document.getElementById("stars-stable-filter").checked;
+  let currentTime = Math.floor(Date.now() / 1000);
+  let fiveHoursAgo = currentTime - (5 * 3600);
+  fetch("/api/top10")
+    .then(r => r.json())
+    .then(top10Data => {
+      let filtered = [];
+      // Get pairs with high WH_PRED from risers and fallers
+      for (let r of top10Data.risers.concat(top10Data.fallers)) {
+        if (r.whale_pred_label === "HIGH" && (includeStable || !isStablecoin(r.pair))) {
+          filtered.push(r);
+        }
+      }
+      // Now filter those that have recent ANOM signal within 5 hours
+      fetch("/api/signals")
+        .then(r => r.json())
+        .then(signals => {
+          let anomPairs = new Set();
+          for (let s of signals) {
+            if (s.signal_type === "ANOM" && s.ts >= fiveHoursAgo) {
+              anomPairs.add(s.pair);
+            }
+          }
+          let finalFiltered = filtered.filter(r => anomPairs.has(r.pair));
+          let tbody = document.querySelector("#stars-table tbody");
+          tbody.innerHTML = "";
+          function fmtTime(ts) {
+            const d = new Date(ts * 1000);
+            return d.toLocaleTimeString();
+          }
+          function renderRow(r) {
+            let pctClass = r.pct > 0 ? "pos" : (r.pct < 0 ? "neg" : "");
+            let flowColor = r.dir === "BUY" ? "#4caf50" : "#f44336";
+            let whaleText = r.whale
+              ? (r.whale_side.toUpperCase() + " " + r.whale_volume.toFixed(3) +
+                 " (" + (r.whale_notional/1000).toFixed(1) + "k)")
+              : "No";
+            let visualUrl = buildVisualUrl(r.pair);
+            let visual = visualUrl ? `<a href="${visualUrl}" target="_blank">Visual</a>` : "-";
+
+            let predClass = r.whale_pred_label === "HIGH" ? "pred_high" :
+              (r.whale_pred_label === "MEDIUM" ? "pred_med" : "pred_low");
+            let relClass = r.reliability_label === "HIGH" ? "rel_high" :
+              (r.reliability_label === "MEDIUM" ? "rel_med" :
+              (r.reliability_label === "LOW" ? "rel_low" : "rel_bad"));
+            return `<tr>
+              <td>${fmtTime(r.ts)}</td>
+              <td>${r.pair}</td>
+              <td>${r.price.toFixed(4)}</td>
+              <td class="${pctClass}">${r.pct.toFixed(2)}%</td>
+              <td>
+                <div class="flow-bar">
+                  <div class="flow-fill" style="width:${r.flow_pct.toFixed(0)}%;background:${flowColor};"></div>
+                </div>
+                ${r.flow_pct.toFixed(1)}%
+              </td>
+              <td>${r.dir}</td>
+              <td>${r.early}</td>
+              <td>${r.alpha}</td>
+              <td>${whaleText}</td>
+              <td>${r.total_score.toFixed(2)}</td>
+              <td style="color:${ r.pump_label === "MEGA_PUMP" ? "#ff4081" :
+                r.pump_label === "EARLY_PUMP" ? "#00bcd4" :
+                "#ccc"}">${r.pump_score.toFixed(1)}</td>
+              <td class="${predClass}">${r.whale_pred_label} (${r.whale_pred_score.toFixed(1)})</td>
+              <td class="${relClass}">${r.reliability_label} (${r.reliability_score.toFixed(0)})</td>
+              <td class="signal_type signal_type_${r.signal_type}">${r.signal_type}</td>
+              <td>${visual}</td>
+              <td>${r.analysis}</td>
+            </tr>`;
+          }
+          for (let r of finalFiltered) {
+            tbody.innerHTML += renderRow(r);
+          }
+        });
+    })
+    .catch(err => console.error("stars error", err));
+}
+
+async function loadNews() {
+  let includeStable = document.getElementById("news-stable-filter").checked;
+  fetch("/api/stats")
+    .then(r => r.json())
+    .then(data => {
+      let tbody = document.querySelector("#news-table tbody");
+      tbody.innerHTML = "";
+      for (let r of data.filter(row => includeStable || !isStablecoin(row.pair))) {
+        let sentiment = r.news_sentiment || 0.5;
+        let classSent = sentiment > 0.7 ? "pos" : (sentiment < 0.3 ? "neg" : "");
+        tbody.innerHTML += `<tr>
+          <td>${r.pair}</td>
+          <td class="${classSent}">${sentiment.toFixed(2)}</td>
+          <td>${new Date(r.last_update_ts * 1000).toLocaleString()}</td>
+          <td>N/A</td>
+        </tr>`;
+      }
+    })
+    .catch(err => console.error("news error", err));
+}
+
+async function loadConfig() {
+  try {
+    let res = await fetch("/api/config");
+    let cfg = await res.json();
+    Object.keys(cfg).forEach(key => {
+      const el = document.getElementById(key);
+      if (el) {
+        if (el.type === 'checkbox') {
+          el.checked = cfg[key];
+        } else {
+          el.value = cfg[key];
+        }
+      }
+    });
+  } catch (e) {
+    console.error("Config load error:", e);
+  }
 }
 
 window.addEventListener("load", () => {
@@ -2651,7 +3224,7 @@ window.addEventListener("load", () => {
       }
     }
 
-    const R2 = 9*9;
+    const R2 = 12*12; // Larger radius for bigger points
     if (closest && closestDist <= R2) {
       heatTooltip.style.display = "block";
       if (!window.fmtTime) {
@@ -2665,7 +3238,7 @@ window.addEventListener("load", () => {
         }
       }
       heatTooltip.textContent =
-        `${closest.pair} | ${fmtTime(closest.ts)} | Flow ${closest.flow.toFixed(1)}% | Pump ${closest.pump.toFixed(1)}`;
+        `${closest.pair} | ${fmtTime(closest.ts)} | Flow ${closest.flow.toFixed(1)}% | Pump ${closest.pump.toFixed(1)} | REL ${closest.rel.toFixed(0)}`;
       heatTooltip.style.left = (ev.clientX + 12) + "px";
       heatTooltip.style.top  = (ev.clientY + 12) + "px";
     } else {
@@ -2695,13 +3268,55 @@ window.addEventListener("load", () => {
       }
     }
 
-    const R2 = 9*9;
+    const R2 = 12*12;
     if (closest && closestDist <= R2) {
       const search = document.getElementById("search");
       if (search) search.value = closest.pair;
       switchTab("markets");
     }
   });
+
+  // Config event listeners
+  document.getElementById('save-config').addEventListener('click', () => {
+    const cfg = {};
+    const inputs = document.querySelectorAll('#config-form input, #config-form select');
+    inputs.forEach(el => {
+      if (el.type === 'checkbox') {
+        cfg[el.id] = el.checked;
+      } else if (el.type === 'number') {
+        cfg[el.id] = parseFloat(el.value);
+      } else {
+        cfg[el.id] = el.value;
+      }
+    });
+    fetch('/api/config', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(cfg)
+    }).then(() => {
+      document.getElementById('config-status').textContent = 'Saved successfully!';
+      setTimeout(() => document.getElementById('config-status').textContent = '', 3000);
+    }).catch(() => {
+      document.getElementById('config-status').textContent = 'Save failed!';
+    });
+  });
+
+  document.getElementById('reset-config').addEventListener('click', () => {
+    fetch('/api/config/reset', {method: 'POST'}).then(() => {
+      loadConfig();
+      document.getElementById('config-status').textContent = 'Reset to defaults!';
+      setTimeout(() => document.getElementById('config-status').textContent = '', 3000);
+    });
+  });
+});
+
+// Event listeners voor filters
+document.getElementById('markets-dir-filter').addEventListener('change', () => applyDirFilter('grid', 'markets-dir-filter'));
+document.getElementById('signals-dir-filter').addEventListener('change', () => applyDirFilter('signals', 'signals-dir-filter'));
+document.getElementById('top10-dir-filter').addEventListener('change', () => {
+  applyDirFilter('top3', 'top10-dir-filter');
+  applyDirFilter('top10-up', 'top10-dir-filter');
+  applyDirFilter('top10-down', 'top10-dir-filter');
 });
 
 function tick() {
@@ -2711,10 +3326,10 @@ function tick() {
     loadSignals();
   } else if (activeTab === "top10") {
     loadTop10();
+  } else if (activeTab === "paper_trading") {
+    loadPaperTrading();
   } else if (activeTab === "backtest") {
     loadBacktest();
-  } else if (activeTab === "trade_advice") {
-    loadTradeAdvice();
   }
 }
 
@@ -2826,6 +3441,158 @@ async fn run_kraken_worker(
     }
 }
 
+async fn run_orderbook_worker(
+    engine: Engine,
+    ws_pairs: Vec<String>,
+    worker_id: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let url = "wss://ws.kraken.com";
+
+    loop {
+        println!(
+            "OB_WS{}: connecting to Kraken orderbook ({} pairs)...",
+            worker_id,
+            ws_pairs.len()
+        );
+
+        let connect_res = connect_async(url).await;
+        let (ws, _) = match connect_res {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("OB_WS{}: connect error {:?}, retry in 5s", worker_id, e);
+                sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+        };
+
+        println!("OB_WS{}: connected", worker_id);
+
+        let (mut write, mut read) = ws.split();
+
+        // Subscribe to orderbook updates (depth 10)
+        let sub = serde_json::json!({
+            "event": "subscribe",
+            "pair": ws_pairs,
+            "subscription": { "name": "book", "depth": 10 }
+        });
+
+        if let Err(e) = write.send(Message::Text(sub.to_string())).await {
+            eprintln!(
+                "OB_WS{}: subscribe send error {:?}, reconnecting...",
+                worker_id, e
+            );
+            sleep(Duration::from_secs(5)).await;
+            continue;
+        }
+
+        println!(
+            "OB_WS{}: subscribed to orderbook for {} pairs",
+            worker_id,
+            ws_pairs.len()
+        );
+
+        while let Some(msg_res) = read.next().await {
+            let msg = match msg_res {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("OB_WS{}: read error {:?}, reconnecting...", worker_id, e);
+                    break;
+                }
+            };
+
+            if let Ok(txt) = msg.to_text() {
+                if txt.contains("\"event\"") {
+                    continue;
+                }
+                if let Ok(val) = serde_json::from_str::<Value>(txt) {
+                    if val.is_array() {
+                        let arr = val.as_array().unwrap();
+                        if arr.len() >= 4 {
+                            let pair_raw = arr[arr.len() - 1].as_str().unwrap_or("UNKNOWN");
+                            let pair = normalize_pair(pair_raw);
+
+                            // Parse orderbook data
+                            if let Some(data) = arr.get(1).and_then(|v| v.as_object()) {
+                                let ts_int = chrono::Utc::now().timestamp();
+                                let mut bids: Vec<(f64, f64)> = Vec::new();
+                                let mut asks: Vec<(f64, f64)> = Vec::new();
+
+                                // Parse bids (either 'b' or 'bs')
+                                if let Some(bid_arr) = data.get("b").or_else(|| data.get("bs")) {
+                                    if let Some(bid_list) = bid_arr.as_array() {
+                                        for item in bid_list {
+                                            if let Some(bid) = item.as_array() {
+                                                if bid.len() >= 2 {
+                                                    let price: f64 = bid[0]
+                                                        .as_str()
+                                                        .unwrap_or("0")
+                                                        .parse()
+                                                        .unwrap_or(0.0);
+                                                    let volume: f64 = bid[1]
+                                                        .as_str()
+                                                        .unwrap_or("0")
+                                                        .parse()
+                                                        .unwrap_or(0.0);
+                                                    if price > 0.0 && volume > 0.0 {
+                                                        bids.push((price, volume));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Parse asks (either 'a' or 'as')
+                                if let Some(ask_arr) = data.get("a").or_else(|| data.get("as")) {
+                                    if let Some(ask_list) = ask_arr.as_array() {
+                                        for item in ask_list {
+                                            if let Some(ask) = item.as_array() {
+                                                if ask.len() >= 2 {
+                                                    let price: f64 = ask[0]
+                                                        .as_str()
+                                                        .unwrap_or("0")
+                                                        .parse()
+                                                        .unwrap_or(0.0);
+                                                    let volume: f64 = ask[1]
+                                                        .as_str()
+                                                        .unwrap_or("0")
+                                                        .parse()
+                                                        .unwrap_or(0.0);
+                                                    if price > 0.0 && volume > 0.0 {
+                                                        asks.push((price, volume));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Update orderbook in engine if we have data
+                                if !bids.is_empty() || !asks.is_empty() {
+                                    // Sort bids descending (highest first)
+                                    bids.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+                                    // Sort asks ascending (lowest first)
+                                    asks.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+
+                                    let ob_state = OrderbookState {
+                                        bids,
+                                        asks,
+                                        timestamp: ts_int,
+                                    };
+                                    engine.orderbooks.insert(pair.clone(), ob_state);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        eprintln!("OB_WS{}: stream ended, reconnecting in 5s...", worker_id);
+        sleep(Duration::from_secs(5)).await;
+    }
+}
+
 // ============================================================================
 // HOOFDSTUK 11 – REST ANOMALY SCANNER
 // ============================================================================
@@ -2878,6 +3645,75 @@ async fn run_anomaly_scanner(
 
         sleep(Duration::from_secs(20)).await;
     }
+}
+
+// ============================================================================
+// HOOFDSTUK 16 – NIEUWS-SENTIMENT SCANNER (NIEUW STAP)
+// ============================================================================
+
+// NIEUW: run_news_scanner functie (stap 2)
+async fn run_news_scanner(engine: Engine) -> Result<(), Box<dyn std::error::Error>> {
+    println!("Starting news sentiment scanner...");
+
+    loop {
+        // Voorbeeld: RSS feed van een crypto nieuws site (bijv. CoinDesk)
+        let rss_url = "https://www.coindesk.com/arc/outboundfeeds/rss/";
+
+        if let Ok(resp) = reqwest::get(rss_url).await {
+            if let Ok(content) = resp.text().await {
+                if let Ok(channel) = Channel::read_from(Cursor::new(content.as_bytes())) {
+                    for item in channel.items {
+                        if let Some(title) = item.title {
+                            // Eenvoudige sentiment analyse: tel positieve/negatieve woorden
+                            let positive_words = vec!["bull", "rally", "surge", "pump", "rise", "green", "up", "buy"];
+                            let negative_words = vec!["bear", "crash", "dump", "fall", "red", "down", "sell", "drop"];
+
+                            let title_lower = title.to_lowercase();
+                            let pos_count: usize = positive_words.iter().map(|w| title_lower.matches(w).count()).sum();
+                            let neg_count: usize = negative_words.iter().map(|w| title_lower.matches(w).count()).sum();
+
+                            let sentiment = if pos_count + neg_count > 0 {
+                                (pos_count as f64) / ((pos_count + neg_count) as f64)
+                            } else {
+                                0.5 // Neutraal
+                            };
+
+                            // Extract pair van title (bijv. "BTC" of "Bitcoin")
+                            if let Some(pair) = extract_pair_from_title(&title) {
+                                engine.update_sentiment(&pair, sentiment);
+                                println!("[NEWS] {} sentiment {:.2} for {}", title, sentiment, pair);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Wacht 10 minuten voor volgende scan
+        sleep(Duration::from_secs(600)).await;
+    }
+}
+
+// NIEUW: Helper functie om pair uit title te extraheren
+fn extract_pair_from_title(title: &str) -> Option<String> {
+    let title_lower = title.to_lowercase();
+    let pairs = vec![
+        ("bitcoin", "BTC/EUR"),
+        ("btc", "BTC/EUR"),
+        ("ethereum", "ETH/EUR"),
+        ("eth", "ETH/EUR"),
+        ("xrp", "XRP/EUR"),
+        ("ripple", "XRP/EUR"),
+        ("doge", "DOGE/EUR"),
+        ("dogecoin", "DOGE/EUR"),
+    ];
+
+    for (keyword, pair) in pairs {
+        if title_lower.contains(keyword) {
+            return Some(pair.to_string());
+        }
+    }
+    None
 }
 
 // ============================================================================
@@ -2984,6 +3820,7 @@ async fn run_cleanup(engine: Engine) {
         let now = Utc::now().timestamp();
         let cutoff_trades = now - 12 * 3600;
         let cutoff_candles = now - 24 * 3600;
+        let cutoff_orderbooks = now - 60; // Remove orderbooks older than 1 minute
 
         engine.trades.retain(|_, v| v.last_update_ts >= cutoff_trades);
 
@@ -2998,7 +3835,10 @@ async fn run_cleanup(engine: Engine) {
             engine.candles.insert(k, CandleState::default());
         }
 
-        println!("Cleanup: oude trades (>12u) en candles (>24u) opgeschoond.");
+        // Cleanup old orderbooks
+        engine.orderbooks.retain(|_, v| v.timestamp >= cutoff_orderbooks);
+
+        println!("Cleanup: oude trades (>12u), candles (>24u) en orderbooks (>1m) opgeschoond.");
     }
 }
 
@@ -3007,8 +3847,9 @@ async fn run_cleanup(engine: Engine) {
 // ============================================================================
 
 
-async fn run_http(engine: Engine) {
+async fn run_http(engine: Engine, config: Arc<Mutex<AppConfig>>) {
     let engine_filter = warp::any().map(move || engine.clone());
+    let config_filter = warp::any().map(move || config.clone());
 
     let api_stats = warp::path!("api" / "stats")
         .and(engine_filter.clone())
@@ -3030,13 +3871,83 @@ async fn run_http(engine: Engine) {
         .and(engine_filter.clone())
         .map(|engine: Engine| warp::reply::json(&engine.backtest_snapshot()));
 
-    let api_trade_advice = warp::path!("api" / "trade_advice")
+    let api_paper_portfolio = warp::path!("api" / "paper_portfolio")
         .and(engine_filter.clone())
-        .map(|engine: Engine| warp::reply::json(&engine.trade_advice_snapshot()));
+        .map(|engine: Engine| {
+            let trader = engine.trader.lock().unwrap();
+            warp::reply::json(&PaperPortfolioResponse {
+                balance: trader.balance,
+                realized_pnl: trader.realized_pnl,
+                unrealized_pnl: trader.balance - trader.initial_balance - trader.realized_pnl,
+                positions: trader.positions.len(),
+                total_trades: trader.trade_history.len(),
+                winrate: if trader.trade_history.is_empty() {
+                    0.0
+                } else {
+                    trader.trade_history.iter().filter(|t| t.pnl > 0.0).count() as f64 / trader.trade_history.len() as f64 * 100.0
+                },
+            })
+        });
+
+    let api_paper_history = warp::path!("api" / "paper_history")
+        .and(engine_filter.clone())
+        .map(|engine: Engine| {
+            let trader = engine.trader.lock().unwrap();
+            warp::reply::json(&trader.trade_history)
+        });
+
+    let api_paper_equity = warp::path!("api" / "paper_equity")
+        .and(engine_filter.clone())
+        .map(|engine: Engine| {
+            let trader = engine.trader.lock().unwrap();
+            warp::reply::json(&trader.equity_curve)
+        });
 
     let api_positions = warp::path!("api" / "positions")
         .and(engine_filter.clone())
         .map(|engine: Engine| warp::reply::json(&engine.positions_snapshot()));
+
+    let api_config_get = warp::path!("api" / "config")
+        .and(config_filter.clone())
+        .map(|config: Arc<Mutex<AppConfig>>| {
+            let cfg = config.lock().unwrap();
+            warp::reply::json(&*cfg)
+        });
+
+    let api_config_post = warp::path!("api" / "config")
+        .and(config_filter.clone())
+        .and(warp::body::json())
+        .map(|config: Arc<Mutex<AppConfig>>, new_cfg: AppConfig| {
+            *config.lock().unwrap() = new_cfg.clone();
+            let _ = save_config(&new_cfg);
+            warp::reply::json(&serde_json::json!({"status": "saved"}))
+        });
+
+    let api_config_reset = warp::path!("api" / "config" / "reset")
+        .and(config_filter.clone())
+        .map(|config: Arc<Mutex<AppConfig>>| {
+            let default = AppConfig::default();
+            *config.lock().unwrap() = default.clone();
+            let _ = save_config(&default);
+            warp::reply::json(&serde_json::json!({"status": "reset"}))
+        });
+
+    // NIEUW: API voor nieuws-sentiment (stap 4)
+    let api_news = warp::path!("api" / "news")
+        .and(engine_filter.clone())
+        .map(|engine: Engine| {
+            let mut news_data = Vec::new();
+            for t in engine.trades.iter() {
+                let pair = t.key().clone();
+                let ts = t.value();
+                news_data.push(serde_json::json!({
+                    "pair": pair,
+                    "sentiment": ts.news_sentiment,
+                    "last_update": ts.last_update_ts
+                }));
+            }
+            warp::reply::json(&news_data)
+        });
 
     let index = warp::path::end().map(|| warp::reply::html(DASHBOARD_HTML));
 
@@ -3045,8 +3956,14 @@ async fn run_http(engine: Engine) {
         .or(api_top10)
         .or(api_heatmap)
         .or(api_backtest)
-        .or(api_trade_advice)
+        .or(api_paper_portfolio)
+        .or(api_paper_history)
+        .or(api_paper_equity)
         .or(api_positions)
+        .or(api_config_get)
+        .or(api_config_post)
+        .or(api_config_reset)
+        .or(api_news) // NIEUW: Toegevoegd aan routes
         .or(index);
 
     let mut port: u16 = 8080;
@@ -3127,11 +4044,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         chunks.len()
     );
 
+    let config = Arc::new(Mutex::new(load_config().await));
     let engine = Engine::new();
     let engine_for_ws = engine.clone();
 
+    // Clone chunks for orderbook workers
+    let ob_chunks: Vec<Vec<String>> = ws_pairs.chunks(20).map(|c| c.to_vec()).collect();
+
+    // Spawn trade WebSocket workers
     for (i, chunk) in chunks.into_iter().enumerate() {
         let e = engine_for_ws.clone();
+        let _cfg = config.clone();  // Niet gebruikt, maar clone om warning te vermijden
         tokio::spawn(async move {
             if let Err(err) = run_kraken_worker(e, chunk, i).await {
                 eprintln!("WS worker {} terminated with error: {:?}", i, err);
@@ -3139,19 +4062,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // Spawn orderbook WebSocket workers
+    let engine_for_ob = engine.clone();
+    for (i, chunk) in ob_chunks.into_iter().enumerate() {
+        let e = engine_for_ob.clone();
+        let _cfg = config.clone();  // Niet gebruikt, maar clone om warning te vermijden
+        tokio::spawn(async move {
+            if let Err(err) = run_orderbook_worker(e, chunk, i).await {
+                eprintln!("OB worker {} terminated with error: {:?}", i, err);
+            }
+        });
+    }
+
     let engine_http = engine.clone();
+    let config_http = config.clone();
     let engine_anom = engine.clone();
     let engine_eval = engine.clone();
     let engine_cleanup = engine.clone();
+    let engine_news = engine.clone(); // NIEUW: Voor news scanner (stap 2)
 
     tokio::join!(
-        async move { run_http(engine_http).await; },
+        async move { run_http(engine_http, config_http).await; },
         async move {
             let _ = run_anomaly_scanner(engine_anom, kraken_keys, key_to_norm).await;
         },
         async move { run_self_evaluator(engine_eval).await; },
         async move { run_cleanup(engine_cleanup).await; },
+        async move { run_news_scanner(engine_news).await; }, // NIEUW: Toegevoegd (stap 2)
     );
 
     Ok(())
 }
+
