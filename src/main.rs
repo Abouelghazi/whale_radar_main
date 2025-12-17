@@ -52,6 +52,16 @@ lazy_static! {
         let json_str = include_str!("pair_keywords.json");
         serde_json::from_str(json_str).expect("Failed to parse pair_keywords.json: ensure the file exists and contains valid JSON format")
     };
+    
+    // Pre-sorted keywords by length (descending) for efficient matching
+    static ref SORTED_KEYWORDS: Vec<(String, String)> = {
+        let mut keywords: Vec<(String, String)> = KEYWORD_MAP
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        keywords.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        keywords
+    };
 }
 
 // ============================================================================
@@ -3729,13 +3739,10 @@ async fn run_news_scanner(engine: Engine) -> Result<(), Box<dyn std::error::Erro
 fn extract_pair_from_title(title: &str) -> Option<String> {
     let title_lower = title.to_lowercase();
 
-    // Sort keywords by length (descending) to check more specific keywords first
-    let mut keywords: Vec<(&String, &String)> = KEYWORD_MAP.iter().collect();
-    keywords.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
-
-    for (keyword, pair) in keywords {
+    // Use pre-sorted keywords to check more specific keywords first
+    for (keyword, pair) in SORTED_KEYWORDS.iter() {
         if title_lower.contains(keyword.as_str()) {
-            return Some(pair.to_string());
+            return Some(pair.clone());
         }
     }
     None
