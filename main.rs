@@ -256,7 +256,7 @@ async fn save_signal_stats(map: &HashMap<String, SignalStats>) {
 // 3.3 TickerState  – REST ticker & anomaly info
 
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TradeState {
     buy_volume: f64,
     sell_volume: f64,
@@ -300,6 +300,42 @@ struct TradeState {
 
     // NIEUW: Nieuws-sentiment integratie (stap 1)
     news_sentiment: f64,  // 0.0 = negatief, 1.0 = positief, default 0.5
+}
+
+impl Default for TradeState {
+    fn default() -> Self {
+        Self {
+            buy_volume: 0.0,
+            sell_volume: 0.0,
+            trade_count: 0,
+            ewma_trade_size: None,
+            ewma_notional: None,
+            ewma_volume: None,
+            last_whale: false,
+            last_whale_side: None,
+            last_whale_volume: None,
+            last_whale_notional: None,
+            last_early: None,
+            last_alpha: None,
+            last_score: 0.0,
+            last_rating: None,
+            last_flow_pct: 0.0,
+            last_dir: "".to_string(),
+            recent_buys: Vec::new(),
+            recent_sells: Vec::new(),
+            recent_buys_5m: Vec::new(),
+            recent_sells_5m: Vec::new(),
+            last_flow_pct_5m: 0.0,
+            last_dir_5m: "".to_string(),
+            recent_prices: Vec::new(),
+            last_pump_score: 0.0,
+            last_pump_signal: None,
+            whale_pred_score: 0.0,
+            whale_pred_label: None,
+            last_update_ts: 0,
+            news_sentiment: 0.5,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -367,6 +403,10 @@ struct Row {
     // reliability fields
     reliability_score: f64,
     reliability_label: String,
+
+    // news fields
+    news_sentiment: f64,
+    last_update_ts: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -1607,6 +1647,8 @@ fn snapshot(&self) -> Vec<Row> {
                 whale_pred_label,
                 reliability_score,
                 reliability_label,
+                news_sentiment: v.news_sentiment,
+                last_update_ts: v.last_update_ts,
             });
         }
 
@@ -3163,18 +3205,18 @@ async function loadStars() {
 
 async function loadNews() {
   let includeStable = document.getElementById("news-stable-filter").checked;
-  fetch("/api/stats")
+  fetch("/api/news")
     .then(r => r.json())
     .then(data => {
       let tbody = document.querySelector("#news-table tbody");
       tbody.innerHTML = "";
       for (let r of data.filter(row => includeStable || !isStablecoin(row.pair))) {
-        let sentiment = r.news_sentiment || 0.5;
+        let sentiment = r.sentiment;
         let classSent = sentiment > 0.7 ? "pos" : (sentiment < 0.3 ? "neg" : "");
         tbody.innerHTML += `<tr>
           <td>${r.pair}</td>
           <td class="${classSent}">${sentiment.toFixed(2)}</td>
-          <td>${new Date(r.last_update_ts * 1000).toLocaleString()}</td>
+          <td>${new Date(r.last_update * 1000).toLocaleString()}</td>
           <td>N/A</td>
         </tr>`;
       }
