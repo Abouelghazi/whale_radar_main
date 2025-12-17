@@ -50,7 +50,7 @@ use warp::Filter;
 lazy_static! {
     static ref KEYWORD_MAP: HashMap<String, String> = {
         let json_str = include_str!("pair_keywords.json");
-        serde_json::from_str(json_str).expect("Failed to parse pair_keywords.json")
+        serde_json::from_str(json_str).expect("Failed to parse pair_keywords.json: ensure the file exists and contains valid JSON format")
     };
 }
 
@@ -3729,8 +3729,12 @@ async fn run_news_scanner(engine: Engine) -> Result<(), Box<dyn std::error::Erro
 fn extract_pair_from_title(title: &str) -> Option<String> {
     let title_lower = title.to_lowercase();
 
-    for (keyword, pair) in KEYWORD_MAP.iter() {
-        if title_lower.contains(keyword) {
+    // Sort keywords by length (descending) to check more specific keywords first
+    let mut keywords: Vec<(&String, &String)> = KEYWORD_MAP.iter().collect();
+    keywords.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+
+    for (keyword, pair) in keywords {
+        if title_lower.contains(keyword.as_str()) {
             return Some(pair.to_string());
         }
     }
