@@ -335,6 +335,15 @@ struct OrderbookState {
     timestamp: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct NewsArticle {
+    title: String,
+    pair: String,
+    sentiment: f64,
+    timestamp: i64,
+    source: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct Row {
     pair: String,
@@ -600,7 +609,8 @@ trades: Arc<DashMap<String, TradeState>>,
     signalled_pairs: Arc<DashMap<String, bool>>,
     weights: Arc<Mutex<ScoreWeights>>,
 
-    trader: Arc<Mutex<TraderState>>, 
+    trader: Arc<Mutex<TraderState>>,
+    news_articles: Arc<Mutex<Vec<NewsArticle>>>,
 }
 
 impl Engine {
@@ -614,6 +624,7 @@ impl Engine {
             signalled_pairs: Arc::new(DashMap::new()),
             weights: Arc::new(Mutex::new(ScoreWeights::default())),
             trader: Arc::new(Mutex::new(TraderState::new())),
+            news_articles: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -643,6 +654,16 @@ impl Engine {
             } else if sentiment < 0.3 {
                 ts.last_score *= 0.95;  // Lichte penalty voor negatief
             }
+        }
+    }
+
+    // NIEUW: add_news_article functie voor nieuws-integratie
+    fn add_news_article(&self, article: NewsArticle) {
+        let mut articles = self.news_articles.lock().unwrap();
+        articles.push(article);
+        // Keep only last 100 articles to prevent memory issues
+        if articles.len() > 100 {
+            articles.remove(0);
         }
     }
 
@@ -3681,6 +3702,17 @@ async fn run_news_scanner(engine: Engine) -> Result<(), Box<dyn std::error::Erro
                             // Extract pair van title (bijv. "BTC" of "Bitcoin")
                             if let Some(pair) = extract_pair_from_title(&title) {
                                 engine.update_sentiment(&pair, sentiment);
+                                
+                                // Store the news article
+                                let article = NewsArticle {
+                                    title: title.clone(),
+                                    pair: pair.clone(),
+                                    sentiment,
+                                    timestamp: Utc::now().timestamp(),
+                                    source: "CoinDesk".to_string(),
+                                };
+                                engine.add_news_article(article);
+                                
                                 println!("[NEWS] {} sentiment {:.2} for {}", title, sentiment, pair);
                             }
                         }
@@ -3949,6 +3981,14 @@ async fn run_http(engine: Engine, config: Arc<Mutex<AppConfig>>) {
             warp::reply::json(&news_data)
         });
 
+    // NIEUW: API voor nieuws artikelen
+    let api_news_articles = warp::path!("api" / "news_articles")
+        .and(engine_filter.clone())
+        .map(|engine: Engine| {
+            let articles = engine.news_articles.lock().unwrap();
+            warp::reply::json(&*articles)
+        });
+
     let index = warp::path::end().map(|| warp::reply::html(DASHBOARD_HTML));
 
     let routes = api_stats
@@ -3964,6 +4004,7 @@ async fn run_http(engine: Engine, config: Arc<Mutex<AppConfig>>) {
         .or(api_config_post)
         .or(api_config_reset)
         .or(api_news) // NIEUW: Toegevoegd aan routes
+        .or(api_news_articles) // NIEUW: Toegevoegd voor nieuws artikelen
         .or(index);
 
     let mut port: u16 = 8080;
