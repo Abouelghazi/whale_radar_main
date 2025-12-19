@@ -2938,6 +2938,10 @@ async function loadTop10() {
   applyDirFilter('top10-down', 'top10-dir-filter');
 }
 
+// Store pairs globally for search filter
+let manualTradePairs = [];
+let manualPairSearchInitialized = false;
+
 async function loadManualTrades() {
   // Get manual trades data
   let tradesData = await fetch("/api/manual_trades").then(r => r.json());
@@ -2951,6 +2955,7 @@ async function loadManualTrades() {
 
   // Populate pair dropdown with search functionality
   let pairs = await fetch("/api/stats").then(r => r.json()).then(d => d.map(r => r.pair));
+  manualTradePairs = pairs; // Store globally for search filter
   let select = document.getElementById("manual-pair");
   
   // Preserve the currently selected value
@@ -2969,24 +2974,27 @@ async function loadManualTrades() {
     select.value = currentValue;
   }
   
-  // Add search filter for pairs
-  let searchInput = document.getElementById("manual-pair-search");
-  searchInput.addEventListener("input", () => {
-    let query = searchInput.value.toLowerCase();
-    let currentValue = select.value;
-    select.innerHTML = "";
-    let filteredPairs = pairs.filter(p => p.toLowerCase().includes(query));
-    filteredPairs.forEach(p => {
-      let opt = document.createElement("option");
-      opt.value = p;
-      opt.text = p;
-      select.appendChild(opt);
+  // Initialize search filter event listener only once
+  if (!manualPairSearchInitialized) {
+    let searchInput = document.getElementById("manual-pair-search");
+    searchInput.addEventListener("input", () => {
+      let query = searchInput.value.toLowerCase();
+      let selectedValue = select.value;
+      select.innerHTML = "";
+      let filteredPairs = manualTradePairs.filter(p => p.toLowerCase().includes(query));
+      filteredPairs.forEach(p => {
+        let opt = document.createElement("option");
+        opt.value = p;
+        opt.text = p;
+        select.appendChild(opt);
+      });
+      // Restore selection if it matches the filter
+      if (selectedValue && filteredPairs.includes(selectedValue)) {
+        select.value = selectedValue;
+      }
     });
-    // Restore selection if it matches the filter
-    if (currentValue && filteredPairs.includes(currentValue)) {
-      select.value = currentValue;
-    }
-  });
+    manualPairSearchInitialized = true;
+  }
 
   // Display active trades
   let tbody = document.querySelector("#manual-trades-table tbody");
