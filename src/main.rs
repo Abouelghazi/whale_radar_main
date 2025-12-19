@@ -2952,6 +2952,10 @@ async function loadManualTrades() {
   // Populate pair dropdown with search functionality
   let pairs = await fetch("/api/stats").then(r => r.json()).then(d => d.map(r => r.pair));
   let select = document.getElementById("manual-pair");
+  
+  // Save current selection before rebuilding
+  let savedValue = select.value;
+  
   select.innerHTML = "";
   pairs.forEach(p => {
     let opt = document.createElement("option");
@@ -2960,18 +2964,36 @@ async function loadManualTrades() {
     select.appendChild(opt);
   });
   
-  // Add search filter for pairs
+  // Restore selection if it still exists in the list
+  if (savedValue && pairs.includes(savedValue)) {
+    select.value = savedValue;
+  }
+  
+  // Add search filter for pairs (only once)
   let searchInput = document.getElementById("manual-pair-search");
-  searchInput.addEventListener("input", () => {
-    let query = searchInput.value.toLowerCase();
-    select.innerHTML = "";
-    pairs.filter(p => p.toLowerCase().includes(query)).forEach(p => {
-      let opt = document.createElement("option");
-      opt.value = p;
-      opt.text = p;
-      select.appendChild(opt);
+  if (!searchInput.dataset.listenerAttached) {
+    searchInput.dataset.listenerAttached = "true";
+    searchInput.addEventListener("input", () => {
+      let query = searchInput.value.toLowerCase();
+      
+      // Save current selection before filtering
+      let savedValue = select.value;
+      
+      select.innerHTML = "";
+      let filteredPairs = pairs.filter(p => p.toLowerCase().includes(query));
+      filteredPairs.forEach(p => {
+        let opt = document.createElement("option");
+        opt.value = p;
+        opt.text = p;
+        select.appendChild(opt);
+      });
+      
+      // Restore selection if it still exists in the filtered list
+      if (savedValue && filteredPairs.includes(savedValue)) {
+        select.value = savedValue;
+      }
     });
-  });
+  }
 
   // Display active trades
   let tbody = document.querySelector("#manual-trades-table tbody");
