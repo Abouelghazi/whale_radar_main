@@ -585,6 +585,8 @@ struct ManualTrade {
     open_ts: i64,
     stop_loss: f64,
     take_profit: f64,
+    fee_pct: f64,
+    notional: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -644,11 +646,13 @@ impl ManualTraderState {
         Ok(())
     }
 
-    fn add_trade(&mut self, pair: &str, price: f64, sl_pct: f64, tp_pct: f64) -> bool {
+    fn add_trade(&mut self, pair: &str, price: f64, sl_pct: f64, tp_pct: f64, notional: f64, fee_pct: f64) -> bool {
         if self.trades.contains_key(pair) {
             return false; // Already have a position
         }
-        let notional = MANUAL_BASE_NOTIONAL;
+        if notional <= 0.0 {
+            return false; // Invalid notional amount
+        }
         let size = notional / price;
         let sl = price * (1.0 - sl_pct / 100.0);
         let tp = price * (1.0 + tp_pct / 100.0);
@@ -659,27 +663,32 @@ impl ManualTraderState {
             open_ts: chrono::Utc::now().timestamp(),
             stop_loss: sl,
             take_profit: tp,
+            fee_pct,
+            notional,
         };
         self.trades.insert(pair.to_string(), trade);
         println!(
-            "[MANUAL TRADE] OPEN {} at {:.5} size {:.5} SL={:.5} TP={:.5}",
-            pair, price, size, sl, tp
+            "[MANUAL TRADE] OPEN {} at {:.5} size {:.5} SL={:.5} TP={:.5} notional={:.2} fee={:.2}%",
+            pair, price, size, sl, tp, notional, fee_pct
         );
         true
     }
 
-    fn close_trade(&mut self, pair: &str, exit_price: f64) -> bool {
+    fn close_trade(&mut self, pair: &str, exit_price: f64, reason: &str) -> bool {
         if let Some(trade) = self.trades.remove(pair) {
             let pnl = (exit_price - trade.entry_price) * trade.size;
-            self.balance += pnl;
+            // Apply fee deduction: fee is calculated on the notional amount
+            let fee_amount = (trade.fee_pct / 100.0) * trade.notional;
+            let pnl_after_fee = pnl - fee_amount;
+            self.balance += pnl_after_fee;
             let now = chrono::Utc::now().timestamp();
             self.equity_curve.push((now, self.balance));
             if self.equity_curve.len() > 365 {
                 self.equity_curve.remove(0);
             }
             println!(
-                "[MANUAL TRADE] CLOSED {} at {:.5} PnL={:.2}",
-                pair, exit_price, pnl
+                "[MANUAL TRADE] CLOSED {} at {:.5} PnL={:.2} Fee={:.2} PnL after fee={:.2} Reason: {}",
+                pair, exit_price, pnl, fee_amount, pnl_after_fee, reason
             );
             true
         } else {
@@ -1412,7 +1421,9 @@ impl Engine {
             };
             self.push_signal(ev);
         }
-        // No automatic SL/TP handling for manual trading
+        
+        // Automatic SL/TP handling for manual trading
+        self.check_manual_trade_stops(pair, price);
     }
 
     // -------------------------------------------------------------------------
@@ -1893,6 +1904,9 @@ fn snapshot(&self) -> Vec<Row> {
                 .and_then(|c| c.close)
                 .unwrap_or(trade.entry_price);
             let pnl = (current_price - trade.entry_price) * trade.size;
+            // Apply fee deduction to displayed PnL
+            let fee_amount = (trade.fee_pct / 100.0) * trade.notional;
+            let pnl_after_fee = pnl - fee_amount;
             let pnl_pct = if trade.entry_price > 0.0 {
                 (current_price - trade.entry_price) / trade.entry_price * 100.0
             } else {
@@ -1906,7 +1920,7 @@ fn snapshot(&self) -> Vec<Row> {
                 stop_loss: trade.stop_loss,
                 take_profit: trade.take_profit,
                 current_price,
-                pnl_abs: pnl,
+                pnl_abs: pnl_after_fee,
                 pnl_pct,
             });
         }
@@ -2115,14 +2129,14 @@ fn snapshot(&self) -> Vec<Row> {
     }
 
     // NIEUW: Handmatige buy
-    async fn manual_add_trade(&self, pair: &str, sl_pct: f64, tp_pct: f64) -> bool {
+    async fn manual_add_trade(&self, pair: &str, sl_pct: f64, tp_pct: f64, notional: f64, fee_pct: f64) -> bool {
         let current_price = self.candles.get(pair).and_then(|c| c.close).unwrap_or(0.0);
         if current_price <= 0.0 {
             return false;
         }
         let (success, state_clone) = {
             let mut trader = self.manual_trader.lock().unwrap();
-            let success = trader.add_trade(pair, current_price, sl_pct, tp_pct);
+            let success = trader.add_trade(pair, current_price, sl_pct, tp_pct, notional, fee_pct);
             (success, trader.clone())
         };
         if success {
@@ -2143,7 +2157,7 @@ fn snapshot(&self) -> Vec<Row> {
         }
         let (success, state_clone) = {
             let mut trader = self.manual_trader.lock().unwrap();
-            let success = trader.close_trade(pair, current_price);
+            let success = trader.close_trade(pair, current_price, "Manual");
             (success, trader.clone())
         };
         if success {
@@ -2155,6 +2169,47 @@ fn snapshot(&self) -> Vec<Row> {
             }
         }
         success
+    }
+
+    fn check_manual_trade_stops(&self, pair: &str, current_price: f64) {
+        // Check if there's a manual trade for this pair and if SL/TP is hit
+        let should_close = {
+            let trader = self.manual_trader.lock().unwrap();
+            if let Some(trade) = trader.trades.get(pair) {
+                // Check stop loss (price <= stop_loss)
+                if current_price <= trade.stop_loss {
+                    Some((pair.to_string(), current_price, "Stop Loss"))
+                }
+                // Check take profit (price >= take_profit)
+                else if current_price >= trade.take_profit {
+                    Some((pair.to_string(), current_price, "Take Profit"))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
+        if let Some((pair_str, exit_price, reason)) = should_close {
+            let (success, state_clone) = {
+                let mut trader = self.manual_trader.lock().unwrap();
+                let success = trader.close_trade(&pair_str, exit_price, reason);
+                (success, trader.clone())
+            };
+            if success {
+                // Save state asynchronously using tokio spawn
+                let pair_clone = pair_str.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = state_clone.save().await {
+                        eprintln!("[ERROR] Failed to save manual trades for {}: {}", pair_clone, e);
+                    }
+                    if let Err(e) = state_clone.save_equity().await {
+                        eprintln!("[ERROR] Failed to save equity for {}: {}", pair_clone, e);
+                    }
+                });
+            }
+        }
     }
 
     async fn load_manual_trader(&self) {
@@ -2396,6 +2451,11 @@ tr:nth-child(even){ background:#252525; }
       <select id="manual-pair" style="width:200px; margin-left:10px;">
         <!-- Vul dynamisch met pairs -->
       </select>
+      <br/><br/>
+      <label style="margin-right:10px;">Notional Amount (€):</label>
+      <input type="number" id="manual-notional" value="100.0" step="10" min="10" style="width:100px;" />
+      <label style="margin-left:20px; margin-right:10px;">Fee %:</label>
+      <input type="number" id="manual-fee" value="0.1" step="0.05" min="0" max="5" style="width:80px;" />
       <br/><br/>
       <label style="margin-right:10px;">Stop Loss %:</label>
       <select id="manual-sl">
@@ -3002,16 +3062,23 @@ window.addEventListener("load", () => {
     let pair = document.getElementById("manual-pair").value;
     let sl_pct = parseFloat(document.getElementById("manual-sl").value);
     let tp_pct = parseFloat(document.getElementById("manual-tp").value);
+    let notional = parseFloat(document.getElementById("manual-notional").value);
+    let fee_pct = parseFloat(document.getElementById("manual-fee").value);
     
     if (!pair) {
       alert("Please select a pair!");
       return;
     }
     
+    if (notional <= 0 || isNaN(notional)) {
+      alert("Please enter a valid notional amount!");
+      return;
+    }
+    
     let res = await fetch("/api/manual_trade", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({pair, sl_pct, tp_pct})
+      body: JSON.stringify({pair, sl_pct, tp_pct, notional, fee_pct})
     });
     let result = await res.json();
     if (result.success) {
@@ -4156,7 +4223,9 @@ async fn run_http(engine: Engine, config: Arc<Mutex<AppConfig>>) {
             let pair = body["pair"].as_str().unwrap_or("");
             let sl_pct = body["sl_pct"].as_f64().unwrap_or(2.0);
             let tp_pct = body["tp_pct"].as_f64().unwrap_or(5.0);
-            let success = engine.manual_add_trade(pair, sl_pct, tp_pct).await;
+            let notional = body["notional"].as_f64().unwrap_or(100.0);
+            let fee_pct = body["fee_pct"].as_f64().unwrap_or(0.1);
+            let success = engine.manual_add_trade(pair, sl_pct, tp_pct, notional, fee_pct).await;
             Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({"success": success})))
         });
 
