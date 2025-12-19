@@ -2966,6 +2966,8 @@ async function loadPaperTrading() {
   // Vul pair dropdown
   let pairs = await fetch("/api/stats").then(r => r.json()).then(d => d.map(r => r.pair));
   let select = document.getElementById("manual-pair");
+  // Sla de huidige selectie op voordat we de dropdown opnieuw vullen
+  let currentSelection = select.value;
   select.innerHTML = "";
   pairs.forEach(p => {
     let opt = document.createElement("option");
@@ -2973,6 +2975,10 @@ async function loadPaperTrading() {
     opt.text = p;
     select.appendChild(opt);
   });
+  // Herstel de vorige selectie als deze nog bestaat in de lijst
+  if (currentSelection && pairs.includes(currentSelection)) {
+    select.value = currentSelection;
+  }
 
   // Open posities
   let positions = await fetch("/api/positions").then(r => r.json());
