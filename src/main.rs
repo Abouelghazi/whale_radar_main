@@ -2952,6 +2952,10 @@ async function loadManualTrades() {
   // Populate pair dropdown with search functionality
   let pairs = await fetch("/api/stats").then(r => r.json()).then(d => d.map(r => r.pair));
   let select = document.getElementById("manual-pair");
+  
+  // Preserve the currently selected value
+  let selectedValue = select.value;
+  
   select.innerHTML = "";
   pairs.forEach(p => {
     let opt = document.createElement("option");
@@ -2960,17 +2964,30 @@ async function loadManualTrades() {
     select.appendChild(opt);
   });
   
+  // Restore the selected value if it still exists in the list
+  if (selectedValue && pairs.includes(selectedValue)) {
+    select.value = selectedValue;
+  }
+  
   // Add search filter for pairs
   let searchInput = document.getElementById("manual-pair-search");
   searchInput.addEventListener("input", () => {
     let query = searchInput.value.toLowerCase();
+    let currentSelected = select.value;
+    let filteredPairs = pairs.filter(p => p.toLowerCase().includes(query));
+    
     select.innerHTML = "";
-    pairs.filter(p => p.toLowerCase().includes(query)).forEach(p => {
+    filteredPairs.forEach(p => {
       let opt = document.createElement("option");
       opt.value = p;
       opt.text = p;
       select.appendChild(opt);
     });
+    
+    // Restore selection if it's in the filtered list
+    if (currentSelected && filteredPairs.includes(currentSelected)) {
+      select.value = currentSelected;
+    }
   });
 
   // Display active trades
