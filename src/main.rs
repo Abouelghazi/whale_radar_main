@@ -648,9 +648,11 @@ impl ManualTraderState {
 
     fn add_trade(&mut self, pair: &str, price: f64, sl_pct: f64, tp_pct: f64, notional: f64, fee_pct: f64) -> bool {
         if self.trades.contains_key(pair) {
+            println!("[MANUAL TRADE] Failed to open {} - position already exists", pair);
             return false; // Already have a position
         }
         if notional <= 0.0 {
+            eprintln!("[MANUAL TRADE] Failed to open {} - invalid notional amount: {}", pair, notional);
             return false; // Invalid notional amount
         }
         let size = notional / price;
@@ -1422,8 +1424,14 @@ impl Engine {
             self.push_signal(ev);
         }
         
-        // Automatic SL/TP handling for manual trading
-        self.check_manual_trade_stops(pair, price);
+        // Automatic SL/TP handling for manual trading - only check if this pair has an active trade
+        let has_active_trade = {
+            let trader = self.manual_trader.lock().unwrap();
+            trader.trades.contains_key(pair)
+        };
+        if has_active_trade {
+            self.check_manual_trade_stops(pair, price);
+        }
     }
 
     // -------------------------------------------------------------------------
