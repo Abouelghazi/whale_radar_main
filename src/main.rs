@@ -1,5 +1,5 @@
 // ============================================================================
-// WhaleRadar – main.rs (Gestructureerd met Hoofdstukken & Secties)
+// WhaleRadar – main.rs (Volledige versie na alle fixes)
 // ============================================================================
 //
 // Overzicht:
@@ -15,7 +15,7 @@
 //     6.3 Analyse & snapshots
 //  7. Betrouwbaarheid & kwaliteitsscores
 //  8. Normalisatie (assets & pairs)
-//  9. Frontend (HTML dashboard)
+//  9. Frontend (HTML dashboard) – Aangepast voor Stars Historie
 // 10. WebSocket workers
 // 11. REST anomaly scanner
 // 12. Self-evaluator (zelflerend)
@@ -23,7 +23,10 @@
 // 14. HTTP server & API
 // 15. Main entrypoint
 //
-// Alleen comments toegevoegd — GEEN invloed op compilatie.
+// Aangepast voor:
+// - Stars historie: Snapshot bij WH_PRED HIGH + recente ANOM, opslaan in JSON zonder duplicate ts.
+// - Historie tabel in tabblad Stars: Gesorteerd op ts desc, dan pair asc, geen filters.
+// - Fixes: Historie timing, server direct beschikbaar, scope fixes, borrow fixes, Send fixes.
 // ============================================================================
 
 use chrono::Utc;
@@ -49,8 +52,22 @@ use warp::Filter;
 
 lazy_static! {
     static ref KEYWORD_MAP: HashMap<String, String> = {
-        let json_str = include_str!("pair_keywords.json");
-        serde_json::from_str(json_str).expect("Failed to parse pair_keywords.json: ensure valid JSON format with string key-value pairs")
+        let mut map = HashMap::new();
+        map.insert("bitcoin".to_string(), "BTC/EUR".to_string());
+        map.insert("btc".to_string(), "BTC/EUR".to_string());
+        map.insert("ethereum".to_string(), "ETH/EUR".to_string());
+        map.insert("eth".to_string(), "ETH/EUR".to_string());
+        map.insert("xrp".to_string(), "XRP/EUR".to_string());
+        map.insert("ripple".to_string(), "XRP/EUR".to_string());
+        map.insert("doge".to_string(), "DOGE/EUR".to_string());
+        map.insert("dogecoin".to_string(), "DOGE/EUR".to_string());
+        map.insert("litecoin".to_string(), "LTC/EUR".to_string());
+        map.insert("ltc".to_string(), "LTC/EUR".to_string());
+        map.insert("cardano".to_string(), "ADA/EUR".to_string());
+        map.insert("ada".to_string(), "ADA/EUR".to_string());
+        map.insert("solana".to_string(), "SOL/EUR".to_string());
+        map.insert("sol".to_string(), "SOL/EUR".to_string());
+        map
     };
     
     // Pre-sorted keywords by length (descending) for efficient matching
@@ -66,58 +83,38 @@ lazy_static! {
 
 lazy_static! {
     static ref SENTIMENT_MAP: HashMap<String, Vec<(String, i32)>> = {
-        match std::fs::read_to_string("sentiment_words.json") {
-            Ok(content) => {
-                match serde_json::from_str::<serde_json::Value>(&content) {
-                    Ok(data) => {
-                        let mut map = HashMap::new();
-                        // Parse positive words
-                        if let Some(pos_arr) = data["positive"].as_array() {
-                            let pos_vec: Vec<(String, i32)> = pos_arr.iter().filter_map(|item| {
-                                if let Some(arr) = item.as_array() {
-                                    if arr.len() == 2 {
-                                        let word = arr[0].as_str()?.to_string();
-                                        let weight = arr[1].as_i64()? as i32;
-                                        Some((word, weight))
-                                    } else {
-                                        None
-                                    }
-                                } else {
-                                    None
-                                }
-                            }).collect();
-                            map.insert("positive".to_string(), pos_vec);
-                        }
-                        // Parse negative words
-                        if let Some(neg_arr) = data["negative"].as_array() {
-                            let neg_vec: Vec<(String, i32)> = neg_arr.iter().filter_map(|item| {
-                                if let Some(arr) = item.as_array() {
-                                    if arr.len() == 2 {
-                                        let word = arr[0].as_str()?.to_string();
-                                        let weight = arr[1].as_i64()? as i32;
-                                        Some((word, weight))
-                                    } else {
-                                        None
-                                    }
-                                } else {
-                                    None
-                                }
-                            }).collect();
-                            map.insert("negative".to_string(), neg_vec);
-                        }
-                        map
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to parse sentiment_words.json: {}", e);
-                        HashMap::new()
-                    }
-                }
-            }
-            Err(_) => {
-                eprintln!("Kon sentiment_words.json niet laden, gebruik lege lijsten");
-                HashMap::new()
-            }
-        }
+        let mut map = HashMap::new();
+        // Hardcoded positive words
+        let positive = vec![
+            ("bull".to_string(), 2),
+            ("rally".to_string(), 2),
+            ("surge".to_string(), 3),
+            ("pump".to_string(), 3),
+            ("rise".to_string(), 1),
+            ("green".to_string(), 1),
+            ("up".to_string(), 1),
+            ("buy".to_string(), 2),
+            ("gain".to_string(), 1),
+            ("boom".to_string(), 3),
+            ("soar".to_string(), 2),
+        ];
+        // Hardcoded negative words
+        let negative = vec![
+            ("bear".to_string(), 2),
+            ("crash".to_string(), 3),
+            ("dump".to_string(), 3),
+            ("fall".to_string(), 1),
+            ("red".to_string(), 1),
+            ("down".to_string(), 1),
+            ("sell".to_string(), 2),
+            ("drop".to_string(), 1),
+            ("decline".to_string(), 1),
+            ("plunge".to_string(), 3),
+            ("slump".to_string(), 2),
+        ];
+        map.insert("positive".to_string(), positive);
+        map.insert("negative".to_string(), negative);
+        map
     };
 }
 
@@ -125,10 +122,8 @@ lazy_static! {
 // HOOFDSTUK 1 – CONFIGURATIE & CONSTANTES
 // ============================================================================
 
-// NIEUW: Uitgebreide Config struct voor alle aanpasbare instellingen
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AppConfig {
-    // 1. Signal Drempels
     pump_conf_threshold: f64,
     whale_pred_high_threshold: f64,
     early_buy_threshold: f64,
@@ -136,38 +131,28 @@ struct AppConfig {
     strong_buy_threshold: f64,
     whale_min_notional: f64,
     anomaly_strength_threshold: f64,
-
-    // 2. Score Gewichten
     flow_weight: f64,
     price_weight: f64,
     whale_weight: f64,
     volume_weight: f64,
     anomaly_weight: f64,
     trend_weight: f64,
-
-    // 3. Paper Trading Instellingen
     initial_balance: f64,
     base_notional: f64,
     sl_pct: f64,
     tp_pct: f64,
     max_positions: usize,
     enable_trading: bool,
-
-    // 4. Engine & Data Instellingen
     ws_workers_per_chunk: usize,
     rest_scan_interval_sec: u64,
     cleanup_interval_sec: u64,
     eval_horizon_sec: i64,
     max_history: usize,
-
-    // 5. UI & Filter Instellingen
     default_dir_filter: String,
     include_stablecoins_default: bool,
     heatmap_min_radius: f64,
     heatmap_max_radius: f64,
     chart_refresh_rate_sec: f64,
-
-    // 6. AI & Self-Learning Instellingen
     ai_success_threshold: f64,
     ai_adjustment_step_up: f64,
     ai_adjustment_step_down: f64,
@@ -177,7 +162,6 @@ struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            // Signal Drempels
             pump_conf_threshold: 0.7,
             whale_pred_high_threshold: 8.0,
             early_buy_threshold: 3.0,
@@ -185,38 +169,28 @@ impl Default for AppConfig {
             strong_buy_threshold: 5.0,
             whale_min_notional: 5000.0,
             anomaly_strength_threshold: 40.0,
-
-            // Score Gewichten
             flow_weight: 2.2,
             price_weight: 0.7,
             whale_weight: 1.4,
             volume_weight: 1.3,
             anomaly_weight: 1.5,
             trend_weight: 1.1,
-
-            // Paper Trading
             initial_balance: 10000.0,
             base_notional: 100.0,
             sl_pct: 0.02,
             tp_pct: 0.05,
             max_positions: 5,
             enable_trading: true,
-
-            // Engine & Data
             ws_workers_per_chunk: 20,
             rest_scan_interval_sec: 20,
             cleanup_interval_sec: 600,
             eval_horizon_sec: 300,
             max_history: 400,
-
-            // UI & Filter
             default_dir_filter: "ALL".to_string(),
             include_stablecoins_default: true,
             heatmap_min_radius: 4.0,
             heatmap_max_radius: 12.0,
             chart_refresh_rate_sec: 1.0,
-
-            // AI & Self-Learning
             ai_success_threshold: 0.7,
             ai_adjustment_step_up: 1.02,
             ai_adjustment_step_down: 0.98,
@@ -225,12 +199,11 @@ impl Default for AppConfig {
     }
 }
 
-// Functies voor config laden/opslaan
 const CONFIG_FILE: &str = "config.json";
 
 async fn load_config() -> AppConfig {
     match tokio::fs::read_to_string(CONFIG_FILE).await {
-        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+        Ok(content) => serde_json::from_str(content.as_str()).unwrap_or_default(),
         Err(_) => {
             let default = AppConfig::default();
             if let Ok(json) = serde_json::to_string_pretty(&default) {
@@ -251,11 +224,6 @@ async fn save_config(config: &AppConfig) -> Result<(), Box<dyn std::error::Error
 // HOOFDSTUK 2 – BAYESIAANS AI / ZELFLEREND SYSTEEM
 // ============================================================================
 
-use std::fs;
-
-use chrono::DateTime;
-
-
 const SIGNAL_FILE: &str = "signals.json";
 const MAX_HISTORY: usize = 20;
 
@@ -265,14 +233,13 @@ const VIRTUAL_MAX_POSITIONS: usize = 5;
 const VIRTUAL_SL_PCT: f64 = 0.02;
 const VIRTUAL_TP_PCT: f64 = 0.05;
 
-
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct SignalStats {
     wins: u32,
     losses: u32,
     threshold: f64,
-    last_updated: Option<DateTime<Utc>>,
-    profit_history: Vec<f64>,
+    last_updated: Option<chrono::DateTime<chrono::Utc>>,
+    profit_history: std::vec::Vec<f64>,
 }
 
 impl SignalStats {
@@ -282,7 +249,7 @@ impl SignalStats {
             losses: 0,
             threshold,
             last_updated: None,
-            profit_history: Vec::new(),
+            profit_history: std::vec::Vec::new(),
         }
     }
 
@@ -312,73 +279,57 @@ impl SignalStats {
 }
 
 async fn load_signal_stats() -> HashMap<String, SignalStats> {
-    match fs::read_to_string(SIGNAL_FILE) {
-        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+    match tokio::fs::read_to_string(SIGNAL_FILE).await {
+        Ok(content) => serde_json::from_str(content.as_str()).unwrap_or_default(),
         Err(_) => HashMap::new(),
     }
 }
 
 async fn save_signal_stats(map: &HashMap<String, SignalStats>) {
     if let Ok(json) = serde_json::to_string_pretty(map) {
-        if let Err(e) = fs::write(SIGNAL_FILE, json) {
+        if let Err(e) = tokio::fs::write(SIGNAL_FILE, json).await {
             eprintln!("[ERR] Kon signals.json niet opslaan: {}", e);
         }
     }
 }
 
-
 // ============================================================================
 // HOOFDSTUK 3 – CORE DATA STRUCTUREN
 // ============================================================================
-// 3.1 TradeState   – realtime trades, flow, whales, pump-detectie
-// 3.2 CandleState  – OHLC candles
-// 3.3 TickerState  – REST ticker & anomaly info
-
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct TradeState {
     buy_volume: f64,
     sell_volume: f64,
     trade_count: u64,
-
     ewma_trade_size: Option<f64>,
     ewma_notional: Option<f64>,
     ewma_volume: Option<f64>,
-
     last_whale: bool,
     last_whale_side: Option<String>,
     last_whale_volume: Option<f64>,
     last_whale_notional: Option<f64>,
-
     last_early: Option<String>,
     last_alpha: Option<String>,
     last_score: f64,
     last_rating: Option<String>,
-
     last_flow_pct: f64,
     last_dir: String,
-    recent_buys: Vec<(f64, f64)>,
-    recent_sells: Vec<(f64, f64)>,
-
-    // 5-min flow
-    recent_buys_5m: Vec<(f64, f64)>,
-    recent_sells_5m: Vec<(f64, f64)>,
+    recent_buys: std::vec::Vec<(f64, f64)>,
+    recent_sells: std::vec::Vec<(f64, f64)>,
+    recent_buys_5m: std::vec::Vec<(f64, f64)>,
+    recent_sells_5m: std::vec::Vec<(f64, f64)>,
     last_flow_pct_5m: f64,
     last_dir_5m: String,
-
-    // pump detection
-    recent_prices: Vec<(f64, f64)>, // (ts, price)
+    recent_prices: std::vec::Vec<(f64, f64)>,
     last_pump_score: f64,
     last_pump_signal: Option<String>,
-
-    // whale prediction
     whale_pred_score: f64,
     whale_pred_label: Option<String>,
-
     last_update_ts: i64,
-
-    // NIEUW: Nieuws-sentiment integratie (stap 1)
-    news_sentiment: f64,  // 0.0 = negatief, 1.0 = positief, default 0.5
+    news_sentiment: f64,
+    recent_anom: bool,
+    last_whale_pred_high: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -388,10 +339,8 @@ struct CandleState {
     low: Option<f64>,
     close: Option<f64>,
     pct_change: Option<f64>,
-
     first_ts: Option<i64>,
     last_ts: Option<i64>,
-
     last_update_ts: i64,
 }
 
@@ -401,7 +350,6 @@ struct TickerState {
     last_vol24h: Option<f64>,
     ewma_vol24h: Option<f64>,
     ewma_abs_return: Option<f64>,
-
     last_anom_ts: Option<i64>,
     last_anom_dir: Option<String>,
     last_anom_strength: Option<f64>,
@@ -409,8 +357,8 @@ struct TickerState {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct OrderbookState {
-    bids: Vec<(f64, f64)>,  // (price, volume)
-    asks: Vec<(f64, f64)>,  // (price, volume)
+    bids: std::vec::Vec<(f64, f64)>,
+    asks: std::vec::Vec<(f64, f64)>,
     timestamp: i64,
 }
 
@@ -438,16 +386,10 @@ struct Row {
     c: f64,
     score: f64,
     rating: String,
-
-    // whale prediction fields
     whale_pred_score: f64,
     whale_pred_label: String,
-
-    // reliability fields
     reliability_score: f64,
     reliability_label: String,
-
-    // news sentiment field
     news_sentiment: f64,
 }
 
@@ -463,7 +405,6 @@ struct ScoreWeights {
 impl Default for ScoreWeights {
     fn default() -> Self {
         Self {
-            // Iets meer nadruk op flow/volume/anomaly, iets minder op pure prijs
             flow_w: 2.2,
             price_w: 0.7,
             whale_w: 1.4,
@@ -488,7 +429,6 @@ struct SignalEvent {
     volume: f64,
     notional: f64,
     price: f64,
-
     rating: String,
     total_score: f64,
     flow_score: f64,
@@ -498,13 +438,11 @@ struct SignalEvent {
     anomaly_score: f64,
     trend_score: f64,
     evaluated: bool,
-
-    // backtest: gerealiseerde performance over ~5m
     ret_5m: Option<f64>,
     eval_horizon_sec: Option<i64>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TopRow {
     ts: i64,
     pair: String,
@@ -522,22 +460,18 @@ struct TopRow {
     whale_notional: f64,
     total_score: f64,
     analysis: String,
-
     whale_pred_score: f64,
     whale_pred_label: String,
-
     reliability_score: f64,
     reliability_label: String,
-
-    // toegevoegd: signal_type
     signal_type: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct Top10Response {
-    best3: Vec<TopRow>,
-    risers: Vec<TopRow>,
-    fallers: Vec<TopRow>,
+    best3: std::vec::Vec<TopRow>,
+    risers: std::vec::Vec<TopRow>,
+    fallers: std::vec::Vec<TopRow>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -546,27 +480,32 @@ struct HeatmapPoint {
     flow_pct: f64,
     pump_score: f64,
     ts: i64,
-    reliability_score: f64,  // TOEGEVOEGD: REL voor heatmap
+    reliability_score: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct BacktestResult {
     signal_type: String,
     direction: String,
-
     total_trades: usize,
     winrate: f64,
     avg_win: f64,
     avg_loss: f64,
     expectancy: f64,
     pnl_sum: f64,
-
     max_drawdown: f64,
     best_trade: f64,
     worst_trade: f64,
     max_losing_streak: usize,
+    equity_curve: std::vec::Vec<f64>,
+}
 
-    equity_curve: Vec<f64>,
+const STARS_HISTORY_FILE: &str = "stars_history.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StarsHistory {
+    history: std::vec::Vec<TopRow>,
+    dirty: bool,
 }
 
 // ============================================================================
@@ -575,7 +514,7 @@ struct BacktestResult {
 
 const MANUAL_TRADES_FILE: &str = "manual_trades.json";
 const MANUAL_EQUITY_FILE: &str = "manual_trades_equity.json";
-const MANUAL_BASE_NOTIONAL: f64 = 100.0; // Fallback
+const MANUAL_BASE_NOTIONAL: f64 = 100.0;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ManualTrade {
@@ -585,8 +524,8 @@ struct ManualTrade {
     open_ts: i64,
     stop_loss: f64,
     take_profit: f64,
-    fee_pct: f64,  // NIEUW: Fee percentage voor verrekening bij close
-    manual_amount: f64,  // NIEUW: Handmatig ingevoerd bedrag voor trade
+    fee_pct: f64,
+    manual_amount: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -606,7 +545,7 @@ struct ManualTraderState {
     initial_balance: f64,
     balance: f64,
     trades: HashMap<String, ManualTrade>,
-    equity_curve: Vec<(i64, f64)>,
+    equity_curve: std::vec::Vec<(i64, f64)>,
 }
 
 impl ManualTraderState {
@@ -615,14 +554,14 @@ impl ManualTraderState {
             initial_balance: VIRTUAL_INITIAL_BALANCE,
             balance: VIRTUAL_INITIAL_BALANCE,
             trades: HashMap::new(),
-            equity_curve: vec![(chrono::Utc::now().timestamp(), VIRTUAL_INITIAL_BALANCE)],
+            equity_curve: std::vec::Vec::new(),
         }
     }
 
     async fn load() -> Self {
         match tokio::fs::read_to_string(MANUAL_TRADES_FILE).await {
             Ok(content) => {
-                match serde_json::from_str(&content) {
+                match serde_json::from_str(content.as_str()) {
                     Ok(state) => state,
                     Err(e) => {
                         eprintln!("[WARN] Failed to parse {}: {}. Starting fresh.", MANUAL_TRADES_FILE, e);
@@ -646,12 +585,11 @@ impl ManualTraderState {
         Ok(())
     }
 
-    // AANGEPAST: Neem fee_pct en manual_amount mee
     fn add_trade(&mut self, pair: &str, price: f64, sl_pct: f64, tp_pct: f64, fee_pct: f64, manual_amount: f64) -> bool {
         if self.trades.contains_key(pair) {
-            return false; // Already have a position
+            return false;
         }
-        let size = manual_amount / price;  // Gebruik manual_amount in plaats van vaste base_notional
+        let size = manual_amount / price;
         let sl = price * (1.0 - sl_pct / 100.0);
         let tp = price * (1.0 + tp_pct / 100.0);
         let trade = ManualTrade {
@@ -661,8 +599,8 @@ impl ManualTraderState {
             open_ts: chrono::Utc::now().timestamp(),
             stop_loss: sl,
             take_profit: tp,
-            fee_pct,  // Opslaan
-            manual_amount,  // Opslaan
+            fee_pct,
+            manual_amount,
         };
         self.trades.insert(pair.to_string(), trade);
         println!(
@@ -672,12 +610,11 @@ impl ManualTraderState {
         true
     }
 
-    // AANGEPAST: Verreken fee bij pnl
     fn close_trade(&mut self, pair: &str, exit_price: f64) -> bool {
         if let Some(trade) = self.trades.remove(pair) {
             let pnl = (exit_price - trade.entry_price) * trade.size;
-            let fee_amount = pnl.abs() * (trade.fee_pct / 100.0);  // Fee op basis van absoluut pnl
-            let net_pnl = pnl - fee_amount;  // Trek fee af
+            let fee_amount = pnl.abs() * (trade.fee_pct / 100.0);
+            let net_pnl = pnl - fee_amount;
             self.balance += net_pnl;
             let now = chrono::Utc::now().timestamp();
             self.equity_curve.push((now, self.balance));
@@ -706,48 +643,48 @@ struct ManualTradeView {
     current_price: f64,
     pnl_abs: f64,
     pnl_pct: f64,
-    fee_pct: f64,  // NIEUW: Voor display
-    manual_amount: f64,  // NIEUW: Voor display
+    fee_pct: f64,
+    manual_amount: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct ManualTradesResponse {
     balance: f64,
     initial_balance: f64,
-    trades: Vec<ManualTradeView>,
+    trades: std::vec::Vec<ManualTradeView>,
 }
 
 // ============================================================================
 // HOOFDSTUK 6 – ENGINE (HART VAN HET SYSTEEM)
 // ============================================================================
 
-
 #[derive(Clone)]
 struct Engine {
-trades: Arc<DashMap<String, TradeState>>,
+    trades: Arc<DashMap<String, TradeState>>,
     candles: Arc<DashMap<String, CandleState>>,
     tickers: Arc<DashMap<String, TickerState>>,
     orderbooks: Arc<DashMap<String, OrderbookState>>,
-    signals: Arc<Mutex<Vec<SignalEvent>>>,
+    signals: Arc<Mutex<std::vec::Vec<SignalEvent>>>,
     signalled_pairs: Arc<DashMap<String, bool>>,
     weights: Arc<Mutex<ScoreWeights>>,
-
-    manual_trader: Arc<Mutex<ManualTraderState>>, 
+    manual_trader: Arc<Mutex<ManualTraderState>>,
     news_sentiment: Arc<DashMap<String, (f64, i64, String)>>,
+    stars_history: Arc<Mutex<StarsHistory>>,
 }
 
 impl Engine {
-        fn new() -> Self {
+    fn new() -> Self {
         Self {
             trades: Arc::new(DashMap::new()),
             candles: Arc::new(DashMap::new()),
             tickers: Arc::new(DashMap::new()),
             orderbooks: Arc::new(DashMap::new()),
-            signals: Arc::new(Mutex::new(Vec::new())),
+            signals: Arc::new(Mutex::new(std::vec::Vec::new())),
             signalled_pairs: Arc::new(DashMap::new()),
             weights: Arc::new(Mutex::new(ScoreWeights::default())),
             manual_trader: Arc::new(Mutex::new(ManualTraderState::new())),
             news_sentiment: Arc::new(DashMap::new()),
+            stars_history: Arc::new(Mutex::new(StarsHistory { history: std::vec::Vec::new(), dirty: false })),
         }
     }
 
@@ -757,7 +694,6 @@ impl Engine {
 
     fn push_signal(&self, ev: SignalEvent) {
         self.mark_signalled(&ev.pair);
-        // No automatic position opening for manual trading
         let mut buf = self.signals.lock().unwrap();
         buf.push(ev);
         if buf.len() > 400 {
@@ -766,51 +702,66 @@ impl Engine {
         }
     }
 
-    // NIEUW: update_sentiment functie voor nieuws-integratie (stap 1)
     fn update_sentiment(&self, pair: &str, sentiment: f64, title: &str) {
         self.news_sentiment.insert(pair.to_string(), (sentiment, Utc::now().timestamp(), title.to_string()));
-        // Optioneel: Boost scores in trades als de pair bestaat
         if let Some(mut ts) = self.trades.get_mut(pair) {
             ts.news_sentiment = sentiment;
-            ts.last_update_ts = Utc::now().timestamp();  // FIX: Update timestamp zodat UI echte data toont
-            // Boost scores: Bij positief sentiment, verhoog anomaly_score
+            ts.last_update_ts = Utc::now().timestamp();
             if sentiment > 0.7 {
-                ts.last_score *= 1.1;  // 10% boost
+                ts.last_score *= 1.1;
             } else if sentiment < 0.3 {
-                ts.last_score *= 0.95;  // Lichte penalty voor negatief
+                ts.last_score *= 0.95;
             }
         }
     }
 
-    // -------------------------------------------------------------------------
-    // TRADE HANDLER
-    // -------------------------------------------------------------------------
+    fn add_to_stars_history(&self, row: TopRow) {
+        println!("[STAR] Adding to history: {} at ts {}", row.pair, row.ts);
+        let mut history = self.stars_history.lock().unwrap();
+        history.history.push(row);
+        history.dirty = true;
+        if history.history.len() > 1000 {
+            history.history.remove(0);
+        }
+    }
+
+    async fn save_stars_history(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let history = self.stars_history.lock().unwrap();
+        let json = serde_json::to_string_pretty(&*history)?;
+        tokio::fs::write(STARS_HISTORY_FILE, json).await?;
+        println!("[STARS SAVER] Saved history with {} entries", history.history.len());
+        Ok(())
+    }
+
+    async fn load_stars_history(&self) -> Result<(), Box<dyn std::error::Error>> {
+        match tokio::fs::read_to_string(STARS_HISTORY_FILE).await {
+            Ok(content) => {
+                match serde_json::from_str(content.as_str()) {
+                    Ok(h) => {
+                        let mut history = self.stars_history.lock().unwrap();
+                        *history = h;
+                        println!("[STARS] Loaded history with {} entries", history.history.len());
+                    }
+                    Err(_) => {}
+                }
+            }
+            Err(_) => {}
+        }
+        Ok(())
+    }
 
     fn handle_trade(&self, pair: &str, price: f64, volume: f64, side: &str, ts: f64) {
         let ts_int = ts.floor() as i64;
         let mut t = self.trades.entry(pair.to_string()).or_default();
 
         let prev_whale = t.last_whale;
-        let prev_early = t
-            .last_early
-            .clone()
-            .unwrap_or_else(|| "NONE".to_string());
-        let prev_alpha = t
-            .last_alpha
-            .clone()
-            .unwrap_or_else(|| "NONE".to_string());
-        let prev_pump_sig = t
-            .last_pump_signal
-            .clone()
-            .unwrap_or_else(|| "NONE".to_string());
-        let prev_pred_label = t
-            .whale_pred_label
-            .clone()
-            .unwrap_or_else(|| "NONE".to_string());
+        let prev_early = t.last_early.clone().unwrap_or_else(|| "NONE".to_string());
+        let prev_alpha = t.last_alpha.clone().unwrap_or_else(|| "NONE".to_string());
+        let prev_pump_sig = t.last_pump_signal.clone().unwrap_or_else(|| "NONE".to_string());
+        let prev_pred_label = t.whale_pred_label.clone().unwrap_or_else(|| "NONE".to_string());
 
         t.last_update_ts = ts_int;
 
-        // volumes
         if side == "b" {
             t.buy_volume += volume;
         } else {
@@ -820,22 +771,18 @@ impl Engine {
 
         let notional = price * volume;
 
-        // EWMA size
         let s0 = t.ewma_trade_size.unwrap_or(volume);
         let s1 = 0.9 * s0 + 0.1 * volume;
         t.ewma_trade_size = Some(s1);
 
-        // EWMA notional
         let n0 = t.ewma_notional.unwrap_or(notional);
         let n1 = 0.9 * n0 + 0.1 * notional;
         t.ewma_notional = Some(n1);
 
-        // EWMA volume
         let v0 = t.ewma_volume.unwrap_or(volume);
         let v1 = 0.9 * v0 + 0.1 * volume;
         t.ewma_volume = Some(v1);
 
-        // Whale detectie
         let min_notional = 5_000.0_f64;
         let is_whale = notional > min_notional && notional > n1 * 2.5;
         if is_whale {
@@ -850,7 +797,6 @@ impl Engine {
             t.last_whale_notional = None;
         }
 
-        // Candle update
         let mut c = self.candles.entry(pair.to_string()).or_default();
         c.last_update_ts = ts_int;
 
@@ -873,12 +819,10 @@ impl Engine {
 
         let pct = c.pct_change.unwrap_or(0.0);
 
-        // price history for pump detection
         t.recent_prices.push((ts, price));
         let cutoff_price = ts - 300.0;
         t.recent_prices.retain(|(x, _)| *x >= cutoff_price);
 
-        // -------------------- Flow (60s) --------------------
         let cutoff = ts - 60.0;
         if side == "b" {
             t.recent_buys.push((ts, volume));
@@ -908,7 +852,6 @@ impl Engine {
         t.last_flow_pct = flow_pct;
         t.last_dir = dir.clone();
 
-        // -------------------- Flow (5 min) --------------------
         let cutoff5 = ts - 300.0;
         if side == "b" {
             t.recent_buys_5m.push((ts, volume));
@@ -938,7 +881,6 @@ impl Engine {
         t.last_flow_pct_5m = flow_pct_5m;
         t.last_dir_5m = dir_5m.clone();
 
-        // -------------------- Anomaly info uit Ticker --------------------
         let (anom_strength, has_recent_anom) = {
             if let Some(tk) = self.tickers.get(pair) {
                 let strength = tk.last_anom_strength.unwrap_or(0.0);
@@ -957,8 +899,6 @@ impl Engine {
             }
         };
 
-        // -------------------- Scores --------------------
-        // Flow short
         let mut flow_score_short = 0.0;
         if flow_pct > 75.0 {
             flow_score_short = 3.0;
@@ -968,7 +908,6 @@ impl Engine {
             flow_score_short = 1.0;
         }
 
-        // Flow long
         let mut flow_score_long = 0.0;
         if dir_5m == "BUY" && flow_pct_5m > 75.0 {
             flow_score_long = 2.0;
@@ -1001,13 +940,9 @@ impl Engine {
             }
         }
 
-        // -------------------- Orderbook analysis --------------------
-        // Adjust whale_score based on orderbook walls (buy/sell pressure)
         if let Some(ob) = self.orderbooks.get(pair) {
             let age = ts_int.saturating_sub(ob.timestamp);
-            // Only use recent orderbook data (within 10 seconds)
             if age >= 0 && age <= 10 {
-                // Calculate total volume in top bids and asks
                 let bid_volume: f64 = ob.bids.iter().take(10).map(|(_, v)| v).sum();
                 let ask_volume: f64 = ob.asks.iter().take(10).map(|(_, v)| v).sum();
                 let total_volume = bid_volume + ask_volume;
@@ -1015,16 +950,12 @@ impl Engine {
                 if total_volume > 0.0 {
                     let bid_ratio = bid_volume / total_volume;
                     
-                    // If there's a large buy wall (high bid volume) and we're seeing buy trades
                     if side == "b" && bid_ratio > 0.65 {
-                        whale_score += 0.5; // Boost score for buy pressure
-                    }
-                    // If there's a large sell wall (high ask volume) and we're seeing sell trades
-                    else if side == "s" && bid_ratio < 0.35 {
-                        whale_score += 0.5; // Boost score for sell pressure
+                        whale_score += 0.5;
+                    } else if side == "s" && bid_ratio < 0.35 {
+                        whale_score += 0.5;
                     }
 
-                    // Additional boost for extreme imbalances
                     if bid_ratio > 0.75 && side == "b" {
                         whale_score += 0.3;
                     } else if bid_ratio < 0.25 && side == "s" {
@@ -1034,7 +965,6 @@ impl Engine {
             }
         }
 
-        // Clamp whale_score to reasonable range
         if whale_score > 4.0 {
             whale_score = 4.0;
         }
@@ -1065,7 +995,6 @@ impl Engine {
             trend_score += 1.0;
         }
 
-        // -------------------- Advanced Pump Detector --------------------
         let mut ret_5s = 0.0_f64;
         let mut ret_30s = 0.0_f64;
         let mut ret_120s = 0.0_f64;
@@ -1159,7 +1088,6 @@ impl Engine {
         }
         t.last_pump_signal = Some(pump_label.clone());
 
-        // totale score
         let weights = self.weights.lock().unwrap().clone();
         let total_score = weights.flow_w * flow_score
             + weights.price_w * price_score
@@ -1168,7 +1096,6 @@ impl Engine {
             + weights.anomaly_w * anomaly_score
             + weights.trend_w * trend_score;
 
-        // Gevoeligere drempels zodat EARLY/BUY eerder afgaan
         let rating = if total_score >= 7.5 {
             "ALPHA BUY".to_string()
         } else if total_score >= 5.0 {
@@ -1184,37 +1111,30 @@ impl Engine {
         t.last_score = total_score;
         t.last_rating = Some(rating.clone());
 
-        // -------------------- Whale Prediction Engine --------------------
         let mut whale_pred_score = 0.0;
 
-        // Sterke kortetermijn BUY-flow zonder dat er al een whale-print is
         if !is_whale && dir == "BUY" && flow_pct > 60.0 {
             whale_pred_score += (flow_pct - 60.0) * 0.08;
         }
 
-        // Consistente 5m BUY-accumulatie
         if !is_whale && dir_5m == "BUY" && flow_pct_5m > 55.0 {
             whale_pred_score += (flow_pct_5m - 55.0) * 0.06;
         }
 
-        // Kleine trade t.o.v. typische size -> stealth accumulation
         if !is_whale && volume < s1 * 0.8 {
             whale_pred_score += 1.0;
         }
 
-        // Rustige prijs terwijl flow oploopt -> stille accumulatie
         let abs_ret_5s = ret_5s.abs();
         let abs_ret_30s = ret_30s.abs();
         if abs_ret_5s < 0.5 && abs_ret_30s < 1.0 && pct >= -0.5 {
             whale_pred_score += 1.0;
         }
 
-        // Volume nog niet extreem -> nog in opbouwfase
         if vol_ratio < 1.3 {
             whale_pred_score += 0.5;
         }
 
-        // Orderbook integration for whale prediction
         if let Some(ob) = self.orderbooks.get(pair) {
             let age = ts_int.saturating_sub(ob.timestamp);
             if age >= 0 && age <= 10 {
@@ -1250,8 +1170,92 @@ impl Engine {
 
         t.whale_pred_score = whale_pred_score;
         t.whale_pred_label = Some(whale_pred_label.clone());
+        t.last_whale_pred_high = whale_pred_label == "HIGH";
 
-        // WH_PRED signaal bij overgang naar HIGH
+        let mut new_early = "NONE".to_string();
+        let mut new_alpha = "NONE".to_string();
+
+        if dir == "BUY" {
+            if rating == "EARLY BUY" || rating == "BUY" {
+                new_early = "BUY".to_string();
+            } else if rating == "STRONG BUY" || rating == "ALPHA BUY" {
+                new_early = "BUY".to_string();
+                new_alpha = "BUY".to_string();
+            }
+        }
+
+        t.last_early = Some(new_early.clone());
+        t.last_alpha = Some(new_alpha.clone());
+
+        // BETROUWBARE HISTORIE: Alleen bij HIGH + recente ANOM toevoegen, geen duplicate ts
+        if whale_pred_label == "HIGH" && has_recent_anom {
+            let history = self.stars_history.lock().unwrap();
+            let last_entry_ts = history.history.iter().filter(|r| r.pair == pair).map(|r| r.ts).max().unwrap_or(0);
+            let time_diff = ts_int.saturating_sub(last_entry_ts);
+            drop(history);
+
+            if time_diff > 3600 && ts_int != last_entry_ts {  // Geen exact dezelfde ts, en minimaal 1 uur tussen entries per pair
+                println!("[STAR SNAPSHOT] Adding unique snapshot for {} at ts {} (time_diff {}s)", pair, ts_int, time_diff);
+                let whale_side = t.last_whale_side.clone().unwrap_or_else(|| "-".to_string());
+                let whale_volume = t.last_whale_volume.unwrap_or(0.0);
+                let whale_notional = t.last_whale_notional.unwrap_or(0.0);
+                let row = TopRow {
+                    ts: ts_int,
+                    pair: pair.to_string(),
+                    price,
+                    pct,
+                    flow_pct,
+                    dir: dir.clone(),
+                    early: new_early.clone(),
+                    alpha: new_alpha.clone(),
+                    pump_score,
+                    pump_label: pump_label.clone(),
+                    whale: is_whale,
+                    whale_side: whale_side.clone(),
+                    whale_volume,
+                    whale_notional,
+                    total_score,
+                    analysis: Self::build_analysis(&Row { 
+                        pair: pair.to_string(), 
+                        price, 
+                        pct, 
+                        whale: is_whale, 
+                        whale_side: whale_side.clone(), 
+                        whale_volume, 
+                        whale_notional, 
+                        flow_pct, 
+                        dir: dir.clone(), 
+                        early: new_early.clone(), 
+                        alpha: new_alpha.clone(), 
+                        pump_score, 
+                        pump_label: pump_label.clone(), 
+                        trades: t.trade_count, 
+                        buys: t.buy_volume, 
+                        sells: t.sell_volume, 
+                        o: c.open.unwrap_or(0.0), 
+                        h: c.high.unwrap_or(0.0), 
+                        l: c.low.unwrap_or(0.0), 
+                        c: c.close.unwrap_or(0.0), 
+                        score: total_score, 
+                        rating: rating.clone(), 
+                        whale_pred_score, 
+                        whale_pred_label: whale_pred_label.clone(), 
+                        reliability_score: Self::compute_reliability(&t, ts_int).0, 
+                        reliability_label: Self::compute_reliability(&t, ts_int).1, 
+                        news_sentiment: t.news_sentiment 
+                    }),
+                    whale_pred_score,
+                    whale_pred_label: whale_pred_label.clone(),
+                    reliability_score: Self::compute_reliability(&t, ts_int).0,
+                    reliability_label: Self::compute_reliability(&t, ts_int).1,
+                    signal_type: "WH_PRED".to_string(),
+                };
+                self.add_to_stars_history(row);
+            } else {
+                println!("[STAR SKIP] {} skipped (time_diff {}s, ts {} == last {})", pair, time_diff, ts_int, last_entry_ts);
+            }
+        }
+
         if whale_pred_label == "HIGH" && prev_pred_label != "HIGH" {
             let ev = SignalEvent {
                 ts: ts_int,
@@ -1281,24 +1285,6 @@ impl Engine {
             self.push_signal(ev);
         }
 
-        // Early / Alpha flags
-        let mut new_early = "NONE".to_string();
-        let mut new_alpha = "NONE".to_string();
-
-        if dir == "BUY" {
-            if rating == "EARLY BUY" || rating == "BUY" {
-                new_early = "BUY".to_string();
-            } else if rating == "STRONG BUY" || rating == "ALPHA BUY" {
-                new_early = "BUY".to_string();
-                new_alpha = "BUY".to_string();
-            }
-        }
-
-        t.last_early = Some(new_early.clone());
-        t.last_alpha = Some(new_alpha.clone());
-
-        // -------------------- Signals --------------------
-        // Pump (Early / Mega)
         if pump_label != "NONE" && pump_label != prev_pump_sig {
             let ev = SignalEvent {
                 ts: ts_int,
@@ -1328,7 +1314,6 @@ impl Engine {
             self.push_signal(ev);
         }
 
-        // Whale
         if is_whale && !prev_whale {
             let ev = SignalEvent {
                 ts: ts_int,
@@ -1362,7 +1347,6 @@ impl Engine {
             self.push_signal(ev);
         }
 
-        // Early
         if new_early != "NONE" && new_early != prev_early {
             let ev = SignalEvent {
                 ts: ts_int,
@@ -1392,7 +1376,6 @@ impl Engine {
             self.push_signal(ev);
         }
 
-        // Alpha
         if new_alpha != "NONE" && new_alpha != prev_alpha {
             let ev = SignalEvent {
                 ts: ts_int,
@@ -1421,12 +1404,7 @@ impl Engine {
             };
             self.push_signal(ev);
         }
-        // No automatic SL/TP handling for manual trading
     }
-
-    // -------------------------------------------------------------------------
-    // TICKER / ANOMALY HANDLER
-    // -------------------------------------------------------------------------
 
     fn handle_ticker(&self, pair: &str, last: f64, vol24h: f64, open: f64, ts_int: i64) {
         let mut ts = self.tickers.entry(pair.to_string()).or_default();
@@ -1452,7 +1430,6 @@ impl Engine {
             1.0
         };
 
-        // EWMA volume en abs-return
         let ew_vol0 = ts.ewma_vol24h.unwrap_or(vol24h);
         let ew_vol1 = 0.9 * ew_vol0 + 0.1 * vol24h;
         ts.ewma_vol24h = Some(ew_vol1);
@@ -1464,13 +1441,12 @@ impl Engine {
         ts.last_price = Some(last);
         ts.last_vol24h = Some(vol24h);
 
-        // Candle presence
+        let mut c = self.candles.entry(pair.to_string()).or_default();  // Verplaatst buiten {} blok
+        c.last_update_ts = ts_int;
+
         {
             let mut t = self.trades.entry(pair.to_string()).or_default();
             t.last_update_ts = ts_int;
-
-            let mut c = self.candles.entry(pair.to_string()).or_default();
-            c.last_update_ts = ts_int;
 
             if c.open.is_none() {
                 c.open = Some(open);
@@ -1491,7 +1467,6 @@ impl Engine {
             }
         }
 
-        // anomaly-score
         let mut score = 0.0;
         score += jump * 2.0;
         score += day_ret.abs() * 0.5;
@@ -1506,6 +1481,87 @@ impl Engine {
             ts.last_anom_ts = Some(ts_int);
             ts.last_anom_dir = Some(direction.to_string());
             ts.last_anom_strength = Some(score);
+
+            let mut t = self.trades.entry(pair.to_string()).or_default();
+            t.recent_anom = true;
+
+            if pair == "POND/EUR" {
+                println!("[DEBUG POND] ANOM detected: strength={:.1}, setting recent_anom=true", score);
+            }
+
+            if t.last_whale_pred_high {
+                println!("[STAR SNAPSHOT] Adding snapshot for {} due to ANOM + recent HIGH", pair);
+                let price = last;
+                let pct = c.pct_change.unwrap_or(0.0);
+                let flow_pct = t.last_flow_pct;
+                let dir = t.last_dir.clone();
+                let new_early = t.last_early.clone().unwrap_or_else(|| "NONE".to_string());
+                let new_alpha = t.last_alpha.clone().unwrap_or_else(|| "NONE".to_string());
+                let pump_score = t.last_pump_score;
+                let pump_label = t.last_pump_signal.clone().unwrap_or_else(|| "NONE".to_string());
+                let is_whale = t.last_whale;
+                let whale_side = t.last_whale_side.clone().unwrap_or_else(|| "-".to_string());
+                let whale_volume = t.last_whale_volume.unwrap_or(0.0);
+                let whale_notional = t.last_whale_notional.unwrap_or(0.0);
+                let total_score = t.last_score;
+                let rating = t.last_rating.clone().unwrap_or_else(|| "NONE".to_string());
+                let whale_pred_score = t.whale_pred_score;
+                let whale_pred_label = t.whale_pred_label.clone().unwrap_or_else(|| "NONE".to_string());
+                let reliability_score = Self::compute_reliability(&t, ts_int).0;
+                let reliability_label = Self::compute_reliability(&t, ts_int).1;
+                let row = TopRow {
+                    ts: ts_int,
+                    pair: pair.to_string(),
+                    price,
+                    pct,
+                    flow_pct,
+                    dir: dir.clone(),
+                    early: new_early.clone(),
+                    alpha: new_alpha.clone(),
+                    pump_score,
+                    pump_label: pump_label.clone(),
+                    whale: is_whale,
+                    whale_side: whale_side.clone(),
+                    whale_volume,
+                    whale_notional,
+                    total_score,
+                    analysis: Self::build_analysis(&Row { 
+                        pair: pair.to_string(), 
+                        price, 
+                        pct, 
+                        whale: is_whale, 
+                        whale_side: whale_side.clone(), 
+                        whale_volume, 
+                        whale_notional, 
+                        flow_pct, 
+                        dir: dir.clone(), 
+                        early: new_early.clone(), 
+                        alpha: new_alpha.clone(), 
+                        pump_score, 
+                        pump_label: pump_label.clone(), 
+                        trades: t.trade_count, 
+                        buys: t.buy_volume, 
+                        sells: t.sell_volume, 
+                        o: c.open.unwrap_or(0.0), 
+                        h: c.high.unwrap_or(0.0), 
+                        l: c.low.unwrap_or(0.0), 
+                        c: c.close.unwrap_or(0.0), 
+                        score: total_score, 
+                        rating: rating.clone(), 
+                        whale_pred_score, 
+                        whale_pred_label: whale_pred_label.clone(), 
+                        reliability_score, 
+                        reliability_label: reliability_label.clone(), 
+                        news_sentiment: t.news_sentiment 
+                    }),
+                    whale_pred_score,
+                    whale_pred_label: whale_pred_label.clone(),
+                    reliability_score,
+                    reliability_label: reliability_label.clone(),
+                    signal_type: "ANOM".to_string(),
+                };
+                self.add_to_stars_history(row);
+            }
 
             let ev = SignalEvent {
                 ts: ts_int,
@@ -1536,24 +1592,17 @@ impl Engine {
         }
     }
 
-    // -------------------------------------------------------------------------
-    // SNAPSHOTS / TOP10 / HEATMAP / BACKTEST / TRADE ADVICE
-    // -------------------------------------------------------------------------
-
-    
     fn compute_reliability(t: &TradeState, now_ts: i64) -> (f64, String) {
         let now_f = now_ts as f64;
 
-        // Kijk naar activiteit in de laatste 60s en 300s
         let cutoff_60 = now_f - 60.0;
         let cutoff_300 = now_f - 300.0;
 
         let mut recent_trades_60: usize = 0;
-        let _vol_60: f64 = 0.0; // Fix unused variable
+        let _vol_60: f64 = 0.0;
         for (_ts, _v) in t.recent_buys.iter().chain(t.recent_sells.iter()) {
             if *_ts >= cutoff_60 {
                 recent_trades_60 += 1;
-                // _vol_60 += *v; // Unused, so commented
             }
         }
 
@@ -1564,10 +1613,8 @@ impl Engine {
             }
         }
 
-        // 1) Trade density score (0–40): hoeveel trades in laatste 60s?
         let td = (recent_trades_60.min(30) as f64 / 30.0) * 40.0;
 
-        // 2) Volume stability (0–20): extreme spikes zijn minder betrouwbaar
         let ew_v = t.ewma_volume.unwrap_or(vol_300.max(1e-9));
         let vol_ratio = if ew_v > 0.0 { vol_300 / ew_v } else { 1.0 };
 
@@ -1579,7 +1626,6 @@ impl Engine {
             20.0
         };
 
-        // 3) Flow consistency (0–20): hoge BUY/SELL-dominantie mét volume
         let mut buys_60: f64 = 0.0;
         let mut sells_60: f64 = 0.0;
         for (_ts, v) in t.recent_buys.iter() {
@@ -1600,7 +1646,6 @@ impl Engine {
         };
 
         let fc = if tot_60 < 1.0 {
-            // bijna geen volume → onbetrouwbaar
             0.0
         } else if flow_pct_60 > 70.0 || flow_pct_60 < 30.0 {
             20.0
@@ -1608,7 +1653,6 @@ impl Engine {
             15.0
         };
 
-        // 4) Recency (0–15): hoe oud is de laatste update?
         let dt = now_ts.saturating_sub(t.last_update_ts);
         let ras = if dt > 300 {
             0.0
@@ -1620,7 +1664,6 @@ impl Engine {
             15.0
         };
 
-        // 5) Time-density (0–15): zijn trades verspreid in de tijd?
         let tds = if recent_trades_60 >= 20 {
             15.0
         } else if recent_trades_60 >= 5 {
@@ -1648,8 +1691,8 @@ impl Engine {
         (score, label)
     }
 
-fn snapshot(&self) -> Vec<Row> {
-        let mut rows = Vec::new();
+    fn snapshot(&self) -> std::vec::Vec<Row> {
+        let mut rows = std::vec::Vec::new();
         let now_ts = chrono::Utc::now().timestamp();
 
         for t in self.trades.iter() {
@@ -1711,7 +1754,7 @@ fn snapshot(&self) -> Vec<Row> {
                 .clone()
                 .unwrap_or_else(|| "NONE".to_string());
 
-                        let (reliability_score, reliability_label) = Self::compute_reliability(&v, now_ts);
+            let (reliability_score, reliability_label) = Self::compute_reliability(&v, now_ts);
 
             rows.push(Row {
                 pair: pair.clone(),
@@ -1751,14 +1794,14 @@ fn snapshot(&self) -> Vec<Row> {
         rows
     }
 
-    fn signals_snapshot(&self) -> Vec<SignalEvent> {
+    fn signals_snapshot(&self) -> std::vec::Vec<SignalEvent> {
         let buf = self.signals.lock().unwrap();
-        let mut v: Vec<SignalEvent> = buf.iter().cloned().collect();
+        let mut v: std::vec::Vec<SignalEvent> = buf.iter().cloned().collect();
         v.sort_by(|a, b| b.ts.cmp(&a.ts));
         v
     }
 
-    fn heatmap_snapshot(&self) -> Vec<HeatmapPoint> {
+    fn heatmap_snapshot(&self) -> std::vec::Vec<HeatmapPoint> {
         self.snapshot()
             .into_iter()
             .map(|r| HeatmapPoint {
@@ -1770,14 +1813,14 @@ fn snapshot(&self) -> Vec<Row> {
                     .get(&r.pair)
                     .map(|t| t.last_update_ts)
                     .unwrap_or(0),
-                reliability_score: r.reliability_score,  // TOEGEVOEGD: REL voor heatmap
+                reliability_score: r.reliability_score,
             })
             .collect()
     }
 
-    fn backtest_snapshot(&self) -> Vec<BacktestResult> {
+    fn backtest_snapshot(&self) -> std::vec::Vec<BacktestResult> {
         let sigs = self.signals.lock().unwrap();
-        let mut groups: HashMap<(String, String), Vec<(i64, f64)>> = HashMap::new();
+        let mut groups: HashMap<(String, String), std::vec::Vec<(i64, f64)>> = HashMap::new();
 
         for ev in sigs.iter() {
             if !ev.evaluated {
@@ -1789,7 +1832,7 @@ fn snapshot(&self) -> Vec<Row> {
             }
         }
 
-        let mut out = Vec::new();
+        let mut out = std::vec::Vec::new();
 
         for ((signal_type, direction), mut trades) in groups {
             trades.sort_by_key(|(ts, _)| *ts);
@@ -1798,7 +1841,7 @@ fn snapshot(&self) -> Vec<Row> {
                 continue;
             }
 
-            let mut equity_curve = Vec::with_capacity(n);
+            let mut equity_curve = std::vec::Vec::with_capacity(n);
             let mut cum = 0.0_f64;
             let mut peak = 0.0_f64;
             let mut max_dd = 0.0_f64;
@@ -1809,7 +1852,7 @@ fn snapshot(&self) -> Vec<Row> {
             let mut loss_sum = 0.0_f64;
             let mut pnl_sum = 0.0_f64;
 
-            let best_trade = f64::MIN; // Fix mut
+            let best_trade = f64::MIN;
             let worst_trade = f64::MAX;
 
             let mut losing_streak = 0usize;
@@ -1891,10 +1934,9 @@ fn snapshot(&self) -> Vec<Row> {
         out
     }
 
-    // Manual trading methods - no automatic position opening
     fn manual_trades_snapshot(&self) -> ManualTradesResponse {
         let trader = self.manual_trader.lock().unwrap();
-        let mut list = Vec::new();
+        let mut list = std::vec::Vec::new();
         for (pair, trade) in trader.trades.iter() {
             let current_price = self
                 .candles
@@ -1917,8 +1959,8 @@ fn snapshot(&self) -> Vec<Row> {
                 current_price,
                 pnl_abs: pnl,
                 pnl_pct,
-                fee_pct: trade.fee_pct,  // NIEUW
-                manual_amount: trade.manual_amount,  // NIEUW
+                fee_pct: trade.fee_pct,
+                manual_amount: trade.manual_amount,
             });
         }
         ManualTradesResponse {
@@ -1929,9 +1971,8 @@ fn snapshot(&self) -> Vec<Row> {
     }
 
     fn build_analysis(row: &Row) -> String {
-        let mut parts: Vec<String> = Vec::new();
+        let mut parts: std::vec::Vec<String> = std::vec::Vec::new();
 
-        // Prijsbeweging
         if row.pct > 5.0 {
             parts.push(format!("Prijs is gestegen met {:.1}%.", row.pct));
         } else if row.pct > 1.0 {
@@ -1942,7 +1983,6 @@ fn snapshot(&self) -> Vec<Row> {
             parts.push("Prijs beweegt zijwaarts.".to_string());
         }
 
-        // Flow en richting
         if row.flow_pct > 70.0 && row.dir == "BUY" {
             parts.push(format!("Sterke koopdruk: {:.0}% buy-flow.", row.flow_pct));
         } else if row.flow_pct > 60.0 && row.dir == "BUY" {
@@ -1953,71 +1993,58 @@ fn snapshot(&self) -> Vec<Row> {
             parts.push("Neutrale markt flow.".to_string());
         }
 
-        // Whale activiteit
         if row.whale {
             let whale_vol = row.whale_volume;
             let whale_not = row.whale_notional / 1000.0;
             parts.push(format!("Whale-trade gedetecteerd: {:.2} eenheden, €{:.0}k notional.", whale_vol, whale_not));
         }
 
-        // Pump score
         if row.pump_score > 5.0 {
             parts.push(format!("Pump-score van {:.1} duidt op mogelijke accumulatie.", row.pump_score));
         } else if row.pump_score > 2.0 {
             parts.push(format!("Matige pump-score van {:.1}.", row.pump_score));
         }
 
-        // Whale prediction
         if row.whale_pred_label == "HIGH" {
             parts.push(format!("Hoge kans op whale-activiteit (score {:.1}).", row.whale_pred_score));
         } else if row.whale_pred_label == "MEDIUM" {
             parts.push(format!("Matige kans op whales (score {:.1}).", row.whale_pred_score));
         }
 
-        // Reliability
         if row.reliability_label == "HIGH" {
             parts.push(format!("Betrouwbaarheid hoog ({:.0}).", row.reliability_score));
         } else if row.reliability_label == "LOW" {
             parts.push(format!("Betrouwbaarheid laag ({:.0}) - let op.", row.reliability_score));
         }
 
-        // Alpha signalen
         if row.alpha == "BUY" {
             parts.push("Alpha BUY signaal: sterke combinatie van factoren.".to_string());
         } else if row.early == "BUY" {
             parts.push("Vroege koopindicatie.".to_string());
         }
 
-        // Nieuws sentiment
         if row.news_sentiment > 0.7 {
             parts.push(format!("Positieve nieuws sentiment ({:.1}).", row.news_sentiment));
         } else if row.news_sentiment < 0.3 {
             parts.push(format!("Negatieve nieuws sentiment ({:.1}).", row.news_sentiment));
         }
 
-        // Als geen specifieke info, algemene opmerking
         if parts.is_empty() {
             parts.push("Neutrale marktcondities.".to_string());
         }
 
-        // Combineer tot één string
-        parts.join(" ")
-
-        // Beperk lengte tot ~200 karakters voor leesbaarheid
-        .chars().take(200).collect::<String>()
+        parts.join(" ").chars().take(200).collect::<String>()
     }
 
     fn top10_snapshot(&self) -> Top10Response {
         let rows = self.snapshot();
 
-        // Helper functie om laatste signal_type te vinden
         let get_last_signal_type = |pair: &str| -> String {
             let signals = self.signals.lock().unwrap();
             signals.iter().rev().find(|s| s.pair == pair).map(|s| s.signal_type.clone()).unwrap_or_else(|| "NONE".to_string())
         };
 
-        // stijgers
-        let mut risers: Vec<TopRow> = rows
+        let mut risers: std::vec::Vec<TopRow> = rows
             .iter()
             .filter(|r| r.dir == "BUY" && r.pct > 0.0)
             .map(|r| TopRow {
@@ -2049,7 +2076,6 @@ fn snapshot(&self) -> Vec<Row> {
             })
             .collect();
 
-        // Best 3: hoogste (score + pump * 1.5 + whale_pred_score * 1.0)
         let mut best3 = risers.clone();
         best3.sort_by(|a, b| {
             let sa = a.total_score + a.pump_score * 1.5 + a.whale_pred_score * 1.0;
@@ -2060,7 +2086,6 @@ fn snapshot(&self) -> Vec<Row> {
             best3.truncate(3);
         }
 
-        // Top 10 stijgers
         risers.sort_by(|a, b| {
             let sa = a.total_score + a.pump_score * 1.5 + a.whale_pred_score * 1.0;
             let sb = b.total_score + b.pump_score * 1.5 + b.whale_pred_score * 1.0;
@@ -2070,8 +2095,7 @@ fn snapshot(&self) -> Vec<Row> {
             risers.truncate(10);
         }
 
-        // dalers
-        let mut fallers: Vec<TopRow> = rows
+        let mut fallers: std::vec::Vec<TopRow> = rows
             .iter()
             .filter(|r| r.dir == "SELL" && r.pct < 0.0)
             .map(|r| {
@@ -2106,8 +2130,8 @@ fn snapshot(&self) -> Vec<Row> {
                     analysis: Self::build_analysis(r),
                     whale_pred_score: r.whale_pred_score,
                     whale_pred_label: r.whale_pred_label.clone(),
-	            reliability_score: r.reliability_score,
-		    reliability_label: r.reliability_label.clone(),
+                    reliability_score: r.reliability_score,
+                    reliability_label: r.reliability_label.clone(),
                     signal_type: get_last_signal_type(&r.pair),
                 }
             })
@@ -2125,7 +2149,6 @@ fn snapshot(&self) -> Vec<Row> {
         }
     }
 
-    // NIEUW: Handmatige buy
     async fn manual_add_trade(&self, pair: &str, sl_pct: f64, tp_pct: f64, fee_pct: f64, manual_amount: f64) -> bool {
         let current_price = self.candles.get(pair).and_then(|c| c.close).unwrap_or(0.0);
         if current_price <= 0.0 {
@@ -2179,19 +2202,19 @@ fn snapshot(&self) -> Vec<Row> {
 // HOOFDSTUK 8 – NORMALISATIE (ASSETS & PAIRS)
 // ============================================================================
 
-
 fn normalize_asset(sym: &str) -> String {
     match sym {
         "XBT" | "XXBT" => "BTC".to_string(),
         "XETH" => "ETH".to_string(),
         "XXRP" => "XRP".to_string(),
         "XDG" => "DOGE".to_string(),
+        "XXLM" => "XLM".to_string(),
         s => s.to_string(),
     }
 }
 
 fn normalize_pair(wsname: &str) -> String {
-    let parts: Vec<&str> = wsname.split('/').collect();
+    let parts: std::vec::Vec<&str> = wsname.split('/').collect();
     if parts.len() != 2 {
         return wsname.to_string();
     }
@@ -2201,9 +2224,8 @@ fn normalize_pair(wsname: &str) -> String {
 }
 
 // ============================================================================
-// HOOFDSTUK 9 – FRONTEND (HTML DASHBOARD) (AANGEPAST)
+// HOOFDSTUK 9 – FRONTEND (HTML DASHBOARD) (AANGEPAST VOOR STARS HISTORIE)
 // ============================================================================
-
 
 const DASHBOARD_HTML: &str = r####"<!DOCTYPE html>
 <html lang="en">
@@ -2385,7 +2407,7 @@ tr:nth-child(even){ background:#252525; }
         <tr>
           <th>Time</th><th>Pair</th><th>Price</th><th>%</th><th>Flow</th><th>Dir</th>
           <th>Early</th><th>Alpha</th><th>Whale</th><th>Total score</th><th>Pump</th>
-          <th>WhPred</th><th>Rel</th><th>Visual</th><th>Analyse</th>
+          <th>Rel</th><th>Visual</th><th>Analyse</th>
         </tr>
       </thead>
       <tbody></tbody>
@@ -2522,6 +2544,17 @@ tr:nth-child(even){ background:#252525; }
     </div>
     <h2>⭐ Stars: ANOM & WH_PRED HIGH (last 5 hours)</h2>
     <table id="stars-table">
+      <thead>
+        <tr>
+          <th>Time</th><th>Pair</th><th>Price</th><th>%</th><th>Flow</th><th>Dir</th>
+          <th>Early</th><th>Alpha</th><th>Whale</th><th>Total score</th><th>Pump</th>
+          <th>WhPred</th><th>Rel</th><th>Type</th><th>Visual</th><th>Analyse</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+    <h2>Historie</h2>
+    <table id="stars-history-table">
       <thead>
         <tr>
           <th>Time</th><th>Pair</th><th>Price</th><th>%</th><th>Flow</th><th>Dir</th>
@@ -2687,7 +2720,6 @@ function ensureHeatTooltip() {
   document.body.appendChild(heatTooltip);
 }
 
-// Filter functie voor DIR
 function applyDirFilter(tableId, filterSelectId) {
   const filterValue = document.getElementById(filterSelectId).value;
   const tbody = document.querySelector(`#${tableId} tbody`);
@@ -3416,6 +3448,27 @@ async function loadStars() {
           for (let r of finalFiltered) {
             tbody.innerHTML += renderRow(r);
           }
+
+          // Load historie tabel: GEEN FILTERS, alleen sorteren op ts desc, dan pair asc
+          fetch("/api/stars_history")
+            .then(r => r.json())
+            .then(history => {
+              let historyFiltered = history; // GEEN FILTERS
+              // Sorteer: eerst op ts desc, dan pair asc
+              historyFiltered.sort((a, b) => {
+                if (b.ts !== a.ts) {
+                  return b.ts - a.ts; // Jongste eerst
+                }
+                return a.pair.localeCompare(b.pair); // Pair asc
+              });
+              let histTbody = document.querySelector("#stars-history-table tbody");
+              histTbody.innerHTML = "";
+              for (let r of historyFiltered.slice(0, 100)) {  // Beperk tot 100 voor performance
+                histTbody.innerHTML += renderRow(r);
+              }
+              console.log(`Loaded ${historyFiltered.length} history entries (no filters, sorted by ts desc, pair asc)`);
+            })
+            .catch(err => console.error("stars history error", err));
         });
     })
     .catch(err => console.error("stars error", err));
@@ -3592,6 +3645,8 @@ function tick() {
     loadBacktest();
   } else if (activeTab === "news") {
     loadNews();
+  } else if (activeTab === "stars") {
+    loadStars();
   }
 }
 
@@ -3612,7 +3667,7 @@ tick();
 
 async fn run_kraken_worker(
     engine: Engine,
-    ws_pairs: Vec<String>,
+    ws_pairs: std::vec::Vec<String>,
     worker_id: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let url = "wss://ws.kraken.com";
@@ -3705,7 +3760,7 @@ async fn run_kraken_worker(
 
 async fn run_orderbook_worker(
     engine: Engine,
-    ws_pairs: Vec<String>,
+    ws_pairs: std::vec::Vec<String>,
     worker_id: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let url = "wss://ws.kraken.com";
@@ -3776,8 +3831,8 @@ async fn run_orderbook_worker(
                             // Parse orderbook data
                             if let Some(data) = arr.get(1).and_then(|v| v.as_object()) {
                                 let ts_int = chrono::Utc::now().timestamp();
-                                let mut bids: Vec<(f64, f64)> = Vec::new();
-                                let mut asks: Vec<(f64, f64)> = Vec::new();
+                                let mut bids: std::vec::Vec<(f64, f64)> = std::vec::Vec::new();
+                                let mut asks: std::vec::Vec<(f64, f64)> = std::vec::Vec::new();
 
                                 // Parse bids (either 'b' or 'bs')
                                 if let Some(bid_arr) = data.get("b").or_else(|| data.get("bs")) {
@@ -3862,7 +3917,7 @@ async fn run_orderbook_worker(
 
 async fn run_anomaly_scanner(
     engine: Engine,
-    kraken_keys: Vec<String>,
+    kraken_keys: std::vec::Vec<String>,
     key_to_norm: HashMap<String, String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!(
@@ -3872,7 +3927,7 @@ async fn run_anomaly_scanner(
 
     loop {
         for chunk in kraken_keys.chunks(20) {
-            let keys: Vec<String> = chunk.iter().cloned().collect();
+            let keys: std::vec::Vec<String> = chunk.iter().cloned().collect();
             let joined = keys.join(",");
             let url =
                 format!("https://api.kraken.com/0/public/Ticker?pair={}", joined);
@@ -4085,7 +4140,7 @@ async fn run_cleanup(engine: Engine) {
 
         engine.trades.retain(|_, v| v.last_update_ts >= cutoff_trades);
 
-        let mut to_reset = Vec::new();
+        let mut to_reset = std::vec::Vec::new();
         for c in engine.candles.iter() {
             let last_ts = c.last_ts.unwrap_or(0);
             if last_ts < cutoff_candles {
@@ -4099,7 +4154,15 @@ async fn run_cleanup(engine: Engine) {
         // Cleanup old orderbooks
         engine.orderbooks.retain(|_, v| v.timestamp >= cutoff_orderbooks);
 
-        println!("Cleanup: oude trades (>12u), candles (>24u) en orderbooks (>1m) opgeschoond.");
+        // NIEUW: Reset recente ANOM flags na 5 uur
+        let cutoff_anom = now - (5 * 3600); // 5 uur
+        for mut t in engine.trades.iter_mut() {
+            if t.last_update_ts < cutoff_anom {
+                t.recent_anom = false;
+            }
+        }
+
+        println!("Cleanup: oude trades (>12u), candles (>24u) en orderbooks (>1m) opgeschoond, oude ANOM flags gereset.");
     }
 }
 
@@ -4172,7 +4235,7 @@ async fn run_http(engine: Engine, config: Arc<Mutex<AppConfig>>) {
     let api_news = warp::path!("api" / "news")
         .and(engine_filter.clone())
         .map(|engine: Engine| {
-            let mut news_data = Vec::new();
+            let mut news_data = std::vec::Vec::new();
             for ns in engine.news_sentiment.iter() {
                 let pair = ns.key().clone();
                 let value = ns.value();
@@ -4187,6 +4250,16 @@ async fn run_http(engine: Engine, config: Arc<Mutex<AppConfig>>) {
                 }));
             }
             warp::reply::json(&news_data)
+        });
+
+    // NIEUW: API voor stars historie
+    let api_stars_history = warp::path!("api" / "stars_history")
+        .and(engine_filter.clone())
+        .map(|engine: Engine| {
+            let history = engine.stars_history.lock().unwrap();
+            let mut sorted_history = history.history.clone();
+            sorted_history.sort_by(|a, b| b.ts.cmp(&a.ts));
+            warp::reply::json(&sorted_history)
         });
 
     let api_manual_trade_post = warp::path!("api" / "manual_trade")
@@ -4228,18 +4301,20 @@ async fn run_http(engine: Engine, config: Arc<Mutex<AppConfig>>) {
         .or(api_config_post)
         .or(api_config_reset)
         .or(api_news)
+        .or(api_stars_history)
         .or(index);
 
     let mut port: u16 = 8080;
     loop {
-        let addr_str = format!("127.0.0.1:{}", port);
+        let addr_str = format!("0.0.0.0:{}", port);  // Bind op alle interfaces voor direct beschikbaar
 
         match TcpListener::bind(&addr_str) {
             Ok(listener) => {
                 drop(listener);
-                println!("Dashboard: http://{}", addr_str);
+                println!("Dashboard: http://0.0.0.0:{} (or http://localhost:{})", port, port);
+                println!("Open in browser: http://localhost:{}", port);
                 warp::serve(routes.clone())
-                    .run(([127, 0, 0, 1], port))
+                    .run(([0, 0, 0, 0], port))  // Bind op alle interfaces
                     .await;
                 break;
             }
@@ -4276,9 +4351,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .expect("Invalid JSON from Kraken AssetPairs");
     println!("Kraken markets: {}", result.len());
 
-    let mut kraken_keys: Vec<String> = Vec::new();
+    let mut kraken_keys: std::vec::Vec<String> = std::vec::Vec::new();
     let mut key_to_norm: HashMap<String, String> = HashMap::new();
-    let mut ws_pairs: Vec<String> = Vec::new();
+    let mut ws_pairs: std::vec::Vec<String> = std::vec::Vec::new();
 
     for (k, v) in result.iter() {
         if let Some(wsname) = v["wsname"].as_str() {
@@ -4299,7 +4374,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ws_pairs.sort();
     ws_pairs.dedup();
     let total_ws_pairs = ws_pairs.len();
-    let chunks: Vec<Vec<String>> = ws_pairs.chunks(20).map(|c| c.to_vec()).collect();
+    let chunk_size = 20;
+    let chunks: std::vec::Vec<std::vec::Vec<String>> = ws_pairs.chunks(chunk_size).map(|c| c.to_vec()).collect();
 
     println!(
         "Using {} pairs for anomaly scanner (REST), {} EUR pairs via WebSocket trades ({} WS workers)",
@@ -4314,55 +4390,115 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load manual trader state from JSON
     engine.load_manual_trader().await;
     println!("Loaded manual trader state");
-    
+
+    // Load stars history
+    engine.load_stars_history().await;
+    println!("Loaded stars history");
+
     let engine_for_ws = engine.clone();
 
     // Clone chunks for orderbook workers
-    let ob_chunks: Vec<Vec<String>> = ws_pairs.chunks(20).map(|c| c.to_vec()).collect();
+    let ob_chunks: std::vec::Vec<std::vec::Vec<String>> = ws_pairs.chunks(chunk_size).map(|c| c.to_vec()).collect();
 
-    // Spawn trade WebSocket workers
+    // Spawn HTTP server als eerste, zodat direct beschikbaar
+    let engine_http = engine.clone();
+    let config_http = config.clone();
+    tokio::spawn(async move {
+        run_http(engine_http, config_http).await;  // Geen if let Err, want geen Result
+    });
+    println!("HTTP server spawned, should be available soon at http://localhost:8080/");
+
+    // Spawn andere tasks
     for (i, chunk) in chunks.into_iter().enumerate() {
         let e = engine_for_ws.clone();
-        let _cfg = config.clone();  // Niet gebruikt, maar clone om warning te vermijden
         tokio::spawn(async move {
             if let Err(err) = run_kraken_worker(e, chunk, i).await {
-                eprintln!("WS worker {} terminated with error: {:?}", i, err);
+                eprintln!("WS worker {} error: {:?}", i, err);
             }
         });
-        // Vertraging tussen workers om rate limiting te voorkomen
-        sleep(Duration::from_millis(500)).await;
+        sleep(Duration::from_secs(2)).await;
     }
 
-    // Spawn orderbook WebSocket workers
     let engine_for_ob = engine.clone();
     for (i, chunk) in ob_chunks.into_iter().enumerate() {
         let e = engine_for_ob.clone();
-        let _cfg = config.clone();  // Niet gebruikt, maar clone om warning te vermijden
         tokio::spawn(async move {
             if let Err(err) = run_orderbook_worker(e, chunk, i).await {
-                eprintln!("OB worker {} terminated with error: {:?}", i, err);
+                eprintln!("OB worker {} error: {:?}", i, err);
             }
         });
-        // Vertraging tussen workers
-        sleep(Duration::from_millis(500)).await;
+        sleep(Duration::from_secs(2)).await;
     }
 
-    let engine_http = engine.clone();
-    let config_http = config.clone();
     let engine_anom = engine.clone();
+    tokio::spawn(async move {
+        if let Err(err) = run_anomaly_scanner(engine_anom, kraken_keys, key_to_norm).await {
+            eprintln!("Anomaly scanner error: {}", err);
+        }
+    });
+
     let engine_eval = engine.clone();
+    tokio::spawn(async move {
+        run_self_evaluator(engine_eval).await;  // Dit heeft geen error return, dus geen if
+    });
+
     let engine_cleanup = engine.clone();
-    let engine_news = engine.clone(); // NIEUW: Voor news scanner (stap 2)
+    tokio::spawn(async move {
+        run_cleanup(engine_cleanup).await;  // Geen error
+    });
 
-    tokio::join!(
-        async move { run_http(engine_http, config_http).await; },
-        async move {
-            let _ = run_anomaly_scanner(engine_anom, kraken_keys, key_to_norm).await;
-        },
-        async move { run_self_evaluator(engine_eval).await; },
-        async move { run_cleanup(engine_cleanup).await; },
-        async move { run_news_scanner(engine_news).await; }, // NIEUW: Toegevoegd (stap 2)
-    );
+    let engine_news = engine.clone();
+    tokio::spawn(async move {
+        if let Err(err) = run_news_scanner(engine_news).await {
+            eprintln!("News scanner error: {}", err);
+        }
+    });
 
+    let engine_stars_saver = engine.clone();
+    tokio::spawn(async move {
+        if let Err(err) = run_stars_history_saver(engine_stars_saver).await {
+            eprintln!("Stars saver error: {}", err);
+        }
+    });
+
+    // Wacht op shutdown (bv. Ctrl+C) in plaats van join, zodat app niet stopt bij worker failure
+    println!("All tasks spawned. App running. Press Ctrl+C to stop.");
+    tokio::signal::ctrl_c().await?;
+    println!("Shutting down...");
+    Ok(())
+}
+
+// NIEUW: Automatische saver voor stars historie
+async fn run_stars_history_saver(engine: Engine) -> Result<(), Box<dyn std::error::Error>> {
+    println!("[STARS SAVER] Started, will save every 10 seconds if dirty");
+    loop {
+        sleep(Duration::from_secs(10)).await;
+
+        let is_dirty = {
+            let history_guard = engine.stars_history.lock().unwrap();
+            history_guard.dirty
+        };
+
+        if is_dirty {
+            let data = {
+                let history_guard = engine.stars_history.lock().unwrap();
+                history_guard.history.clone()
+            };
+
+            match save_stars_history_to_file(&data).await {
+                Ok(_) => {
+                    let mut history_guard = engine.stars_history.lock().unwrap();
+                    history_guard.dirty = false;
+                    println!("[STARS SAVER] Saved successfully, set dirty=false");
+                }
+                Err(e) => eprintln!("[STARS SAVER] Save error: {}", e),
+            }
+        }
+    }
+}
+
+async fn save_stars_history_to_file(data: &[TopRow]) -> Result<(), Box<dyn std::error::Error>> {
+    let json = serde_json::to_string_pretty(data)?;
+    tokio::fs::write(STARS_HISTORY_FILE, json).await?;
     Ok(())
 }
