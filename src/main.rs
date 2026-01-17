@@ -1,5 +1,5 @@
 // ============================================================================
-// WhaleRadar – main.rs (Volledige versie na alle fixes)
+// WhaleRadar – main.rs (Volledige versie voor historie + app)
 // ============================================================================
 //
 // Overzicht:
@@ -24,9 +24,8 @@
 // 15. Main entrypoint
 //
 // Aangepast voor:
-// - Stars historie: Snapshot bij WH_PRED HIGH + recente ANOM, opslaan in JSON zonder duplicate ts.
-// - Historie tabel in tabblad Stars: Gesorteerd op ts desc, dan pair asc, geen filters.
-// - Fixes: Historie timing, server direct beschikbaar, scope fixes, borrow fixes, Send fixes.
+// - Stars historie: Load bij startup, save tijdens runtime, API voor historie tabel.
+// - Fixes: Parse errors, dubbele velden gefixed.
 // ============================================================================
 
 use chrono::Utc;
@@ -736,16 +735,30 @@ impl Engine {
     async fn load_stars_history(&self) -> Result<(), Box<dyn std::error::Error>> {
         match tokio::fs::read_to_string(STARS_HISTORY_FILE).await {
             Ok(content) => {
+                let mut history = self.stars_history.lock().unwrap();
+                // Probeer eerst de volledige StarsHistory struct te parsen
                 match serde_json::from_str(content.as_str()) {
-                    Ok(h) => {
-                        let mut history = self.stars_history.lock().unwrap();
-                        *history = h;
-                        println!("[STARS] Loaded history with {} entries", history.history.len());
+                    Ok(stars_history) => {
+                        *history = stars_history;
+                        println!("[STARS] Loaded full StarsHistory with {} entries", history.history.len());
                     }
-                    Err(_) => {}
+                    Err(_) => {
+                        // Fallback: probeer als oude array van TopRow te parsen
+                        match serde_json::from_str::<Vec<TopRow>>(content.as_str()) {
+                            Ok(history_vec) => {
+                                *history = StarsHistory { history: history_vec, dirty: false };
+                                println!("[STARS] Loaded legacy array with {} entries", history.history.len());
+                            }
+                            Err(e) => {
+                                eprintln!("[STARS] Failed to parse stars_history.json (legacy fallback also failed): {}", e);
+                            }
+                        }
+                    }
                 }
             }
-            Err(_) => {}
+            Err(e) => {
+                eprintln!("[STARS] Failed to read stars_history.json: {}", e);
+            }
         }
         Ok(())
     }
@@ -1557,7 +1570,7 @@ impl Engine {
                     whale_pred_score,
                     whale_pred_label: whale_pred_label.clone(),
                     reliability_score,
-                    reliability_label: reliability_label.clone(),
+                    reliability_label: Self::compute_reliability(&t, ts_int).1,
                     signal_type: "ANOM".to_string(),
                 };
                 self.add_to_stars_history(row);
@@ -2720,12 +2733,12 @@ function ensureHeatTooltip() {
   document.body.appendChild(heatTooltip);
 }
 
-function applyDirFilter(tableId, filterSelectId) {
+function applyDirFilter(tableId, filterSelectId, dirIndex) {
   const filterValue = document.getElementById(filterSelectId).value;
   const tbody = document.querySelector(`#${tableId} tbody`);
   const rows = tbody.querySelectorAll('tr');
   rows.forEach(row => {
-    const dirCell = row.cells[5]; // Assuming DIR is the 6th column (index 5)
+    const dirCell = row.cells[dirIndex];
     if (dirCell) {
       const dirText = dirCell.textContent.trim();
       if (filterValue === 'ALL' || dirText === filterValue) {
@@ -2861,7 +2874,7 @@ async function loadMarkets() {
 
     tbody.innerHTML += row;
   }
-  applyDirFilter('grid', 'markets-dir-filter');
+  applyDirFilter('grid', 'markets-dir-filter', 5);
 }
 
 async function loadSignals() {
@@ -2910,7 +2923,7 @@ async function loadSignals() {
 
     tbody.innerHTML += row;
   }
-  applyDirFilter('signals', 'signals-dir-filter');
+  applyDirFilter('signals', 'signals-dir-filter', 3);
 }
 
 async function loadTop10() {
@@ -2989,9 +3002,9 @@ async function loadTop10() {
   for (let r of data.fallers.filter(row => includeStable || !isStablecoin(row.pair))) {
     downBody.innerHTML += renderRow(r);
   }
-  applyDirFilter('top3', 'top10-dir-filter');
-  applyDirFilter('top10-up', 'top10-dir-filter');
-  applyDirFilter('top10-down', 'top10-dir-filter');
+  applyDirFilter('top3', 'top10-dir-filter', 5);
+  applyDirFilter('top10-up', 'top10-dir-filter', 5);
+  applyDirFilter('top10-down', 'top10-dir-filter', 5);
 }
 
 async function loadManualTrades() {
@@ -3624,12 +3637,12 @@ window.addEventListener("load", () => {
 });
 
 // Event listeners voor filters
-document.getElementById('markets-dir-filter').addEventListener('change', () => applyDirFilter('grid', 'markets-dir-filter'));
-document.getElementById('signals-dir-filter').addEventListener('change', () => applyDirFilter('signals', 'signals-dir-filter'));
+document.getElementById('markets-dir-filter').addEventListener('change', () => applyDirFilter('grid', 'markets-dir-filter', 5));
+document.getElementById('signals-dir-filter').addEventListener('change', () => applyDirFilter('signals', 'signals-dir-filter', 3));
 document.getElementById('top10-dir-filter').addEventListener('change', () => {
-  applyDirFilter('top3', 'top10-dir-filter');
-  applyDirFilter('top10-up', 'top10-dir-filter');
-  applyDirFilter('top10-down', 'top10-dir-filter');
+  applyDirFilter('top3', 'top10-dir-filter', 5);
+  applyDirFilter('top10-up', 'top10-dir-filter', 5);
+  applyDirFilter('top10-down', 'top10-dir-filter', 5);
 });
 
 function tick() {
@@ -3972,6 +3985,8 @@ async fn run_anomaly_scanner(
 async fn run_news_scanner(engine: Engine) -> Result<(), Box<dyn std::error::Error>> {
     println!("Starting news sentiment scanner...");
 
+    let mut processed_titles: std::collections::HashSet<String> = std::collections::HashSet::new();
+
     loop {
         // Voorbeeld: RSS feed van een crypto nieuws site (bijv. CoinDesk)
         let rss_url = "https://cointelegraph.com/rss";
@@ -3981,6 +3996,14 @@ async fn run_news_scanner(engine: Engine) -> Result<(), Box<dyn std::error::Erro
                 if let Ok(channel) = Channel::read_from(Cursor::new(content.as_bytes())) {
                     for item in channel.items {
                         if let Some(title) = item.title {
+                            // Check if we've already processed this title
+                            if processed_titles.contains(&title) {
+                                continue; // Skip already processed articles
+                            }
+
+                            // Mark as processed
+                            processed_titles.insert(title.clone());
+
                             // Eenvoudige sentiment analyse: tel positieve/negatieve woorden
                             let positive_words = SENTIMENT_MAP.get("positive").cloned().unwrap_or_default();
                             let negative_words = SENTIMENT_MAP.get("negative").cloned().unwrap_or_default();
@@ -4162,7 +4185,13 @@ async fn run_cleanup(engine: Engine) {
             }
         }
 
-        println!("Cleanup: oude trades (>12u), candles (>24u) en orderbooks (>1m) opgeschoond, oude ANOM flags gereset.");
+        // FIX: Houd alleen signals van laatste 24 uur om Type kolom te vullen
+        {
+            let mut sigs = engine.signals.lock().unwrap();
+            sigs.retain(|ev| now - ev.ts < 86400); // 24 uur
+        }
+
+        println!("Cleanup: oude trades (>12u), candles (>24u), orderbooks (>1m) en signals (>24u) opgeschoond, oude ANOM flags gereset.");
     }
 }
 
