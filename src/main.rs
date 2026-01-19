@@ -15,17 +15,30 @@
 //     6.3 Analyse & snapshots
 //  7. Betrouwbaarheid & kwaliteitsscores
 //  8. Normalisatie (assets & pairs)
-//  9. Frontend (HTML dashboard) – Aangepast voor Stars Historie
+//  9. Frontend (HTML dashboard) – Aangepast voor Confidence + Momentum + Trade Score
 // 10. WebSocket workers
 // 11. REST anomaly scanner
 // 12. Self-evaluator (zelflerend)
-// 13. Cleanup & onderhoud
-// 14. HTTP server & API
-// 15. Main entrypoint
+// 13. Cleanup & onderhoud (agressiever gemaakt)
+// 14. HTTP server & API (met health endpoint)
+// 15. Main entrypoint (met graceful shutdown)
 //
 // Aangepast voor:
 // - Stars historie: Load bij startup, save tijdens runtime, API voor historie tabel.
 // - Fixes: Parse errors, dubbele velden gefixed.
+// - FIX: Type kolom in Top 10 tabellen nu gebaseerd op huidige staat in plaats van signal history.
+// - VERBETERING: Top 10 betrouwbaarder gemaakt met confidence score en Rel integratie in Type.
+// - UPDATE: Confidence kolom toegevoegd.
+// - NIEUW: Momentum Score toegevoegd voor betere koopmoment beslissingen.
+// - NIEUW: Trade Score toegevoegd als vervanger van Total Score voor holistische beslissingen.
+// - FIX: Config save nu tolerant voor komma's (vervang door punten voor parseFloat).
+// - FIX: TopRow sortering gebruikt nu trade_score in plaats van total_score.
+// - NIEUW: Agressieve cleanup elke 5 minuten om memory leaks te voorkomen.
+// - NIEUW: Health endpoint (/healthz) voor monitoring.
+// - NIEUW: Graceful shutdown met broadcast kanaal.
+// - NIEUW: Timeouts op HTTP requests.
+// - NIEUW: Logging voor health en data sizes.
+// - FIX: Syntax fouten opgelost, consistent gebruik van reqwest client.
 // ============================================================================
 
 use chrono::Utc;
@@ -40,7 +53,8 @@ use std::collections::HashMap;
 use std::io::Cursor;
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
-use tokio::time::{sleep, Duration};
+use tokio::sync::broadcast;
+use tokio::time::{interval, sleep, Duration};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use warp::Filter;
@@ -199,6 +213,9 @@ impl Default for AppConfig {
 }
 
 const CONFIG_FILE: &str = "config.json";
+lazy_static! {
+    static ref START_TIME: i64 = Utc::now().timestamp(); // Voor uptime tracking
+}
 
 async fn load_config() -> AppConfig {
     match tokio::fs::read_to_string(CONFIG_FILE).await {
@@ -238,7 +255,7 @@ struct SignalStats {
     losses: u32,
     threshold: f64,
     last_updated: Option<chrono::DateTime<chrono::Utc>>,
-    profit_history: std::vec::Vec<f64>,
+    profit_history: Vec<f64>,
 }
 
 impl SignalStats {
@@ -248,7 +265,7 @@ impl SignalStats {
             losses: 0,
             threshold,
             last_updated: None,
-            profit_history: std::vec::Vec::new(),
+            profit_history: Vec::new(),
         }
     }
 
@@ -314,13 +331,13 @@ struct TradeState {
     last_rating: Option<String>,
     last_flow_pct: f64,
     last_dir: String,
-    recent_buys: std::vec::Vec<(f64, f64)>,
-    recent_sells: std::vec::Vec<(f64, f64)>,
-    recent_buys_5m: std::vec::Vec<(f64, f64)>,
-    recent_sells_5m: std::vec::Vec<(f64, f64)>,
+    recent_buys: Vec<(f64, f64)>,
+    recent_sells: Vec<(f64, f64)>,
+    recent_buys_5m: Vec<(f64, f64)>,
+    recent_sells_5m: Vec<(f64, f64)>,
     last_flow_pct_5m: f64,
     last_dir_5m: String,
-    recent_prices: std::vec::Vec<(f64, f64)>,
+    recent_prices: Vec<(f64, f64)>,
     last_pump_score: f64,
     last_pump_signal: Option<String>,
     whale_pred_score: f64,
@@ -356,8 +373,8 @@ struct TickerState {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct OrderbookState {
-    bids: std::vec::Vec<(f64, f64)>,
-    asks: std::vec::Vec<(f64, f64)>,
+    bids: Vec<(f64, f64)>,
+    asks: Vec<(f64, f64)>,
     timestamp: i64,
 }
 
@@ -457,20 +474,22 @@ struct TopRow {
     whale_side: String,
     whale_volume: f64,
     whale_notional: f64,
-    total_score: f64,
     analysis: String,
     whale_pred_score: f64,
     whale_pred_label: String,
     reliability_score: f64,
     reliability_label: String,
     signal_type: String,
+    confidence: f64,
+    momentum: f64,
+    trade_score: f64,  // NIEUW: Vervangt total_score
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct Top10Response {
-    best3: std::vec::Vec<TopRow>,
-    risers: std::vec::Vec<TopRow>,
-    fallers: std::vec::Vec<TopRow>,
+    best3: Vec<TopRow>,
+    risers: Vec<TopRow>,
+    fallers: Vec<TopRow>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -496,15 +515,80 @@ struct BacktestResult {
     best_trade: f64,
     worst_trade: f64,
     max_losing_streak: usize,
-    equity_curve: std::vec::Vec<f64>,
+    equity_curve: Vec<f64>,
 }
 
 const STARS_HISTORY_FILE: &str = "stars_history.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StarsHistory {
-    history: std::vec::Vec<TopRow>,
+    history: Vec<TopRow>,
     dirty: bool,
+}
+
+// ============================================================================
+// NIEUWE FUNCTIES: Confidence, Momentum en Trade Score Berekening
+// ============================================================================
+
+fn compute_confidence(r: &Row, trades_count: usize, rel_score: f64) -> f64 {
+    let mut conf = 0.0;
+    // Base on Rel (0-100)
+    conf += rel_score;
+    // Bonus for trades
+    if trades_count >= 10 {
+        conf += 20.0;
+    } else if trades_count >= 5 {
+        conf += 10.0;
+    }
+    // Bonus for strong signals
+    if r.alpha == "BUY" || r.early == "BUY" {
+        conf += 10.0;
+    }
+    // Penalty for low Rel
+    if rel_score < 50.0 {
+        conf *= 0.8;
+    }
+    conf.min(100.0).max(0.0)
+}
+
+fn compute_momentum(pct: f64, pump_score: f64, flow_pct: f64) -> f64 {
+    let pct_score = (pct.clamp(-10.0, 10.0) + 10.0) / 20.0 * 40.0;  // 0-40 voor % (-10% tot +10%)
+    let pump_norm = pump_score.min(10.0) / 10.0 * 30.0;  // 0-30 voor pump
+    let flow_norm = flow_pct / 100.0 * 30.0;  // 0-30 voor flow
+    (pct_score + pump_norm + flow_norm).min(100.0)
+}
+
+fn compute_trade_score(
+    momentum: f64,
+    confidence: f64,
+    rel_score: f64,
+    whale_pred: f64,
+    pump_score: f64,
+    flow_pct: f64,
+    pct_change: f64,
+) -> f64 {
+    let mut score = 0.0;
+    
+    // Gewichten
+    score += momentum * 0.3;       // Momentum kracht
+    score += confidence * 0.2;     // Betrouwbaarheid
+    score += rel_score * 0.2;      // Data kwaliteit
+    score += whale_pred * 0.1;     // Whale kans
+    score += pump_score * 0.1;     // Impuls
+    score += flow_pct * 0.1;       // Marktstemming
+    
+    // Risico penaliteiten
+    if rel_score < 50.0 {
+        score -= 20.0;  // Slechte data = hoger risico
+    }
+    if pct_change > 20.0 {
+        score -= 10.0;  // Te grote stijging = mogelijk pump, risico op dump
+    }
+    if whale_pred < 4.0 {
+        score -= 5.0;   // Lage whale kans = minder overtuigend
+    }
+    
+    score.max(0.0).min(100.0)
 }
 
 // ============================================================================
@@ -544,7 +628,7 @@ struct ManualTraderState {
     initial_balance: f64,
     balance: f64,
     trades: HashMap<String, ManualTrade>,
-    equity_curve: std::vec::Vec<(i64, f64)>,
+    equity_curve: Vec<(i64, f64)>,
 }
 
 impl ManualTraderState {
@@ -553,7 +637,7 @@ impl ManualTraderState {
             initial_balance: VIRTUAL_INITIAL_BALANCE,
             balance: VIRTUAL_INITIAL_BALANCE,
             trades: HashMap::new(),
-            equity_curve: std::vec::Vec::new(),
+            equity_curve: Vec::new(),
         }
     }
 
@@ -650,7 +734,7 @@ struct ManualTradeView {
 struct ManualTradesResponse {
     balance: f64,
     initial_balance: f64,
-    trades: std::vec::Vec<ManualTradeView>,
+    trades: Vec<ManualTradeView>,
 }
 
 // ============================================================================
@@ -663,7 +747,7 @@ struct Engine {
     candles: Arc<DashMap<String, CandleState>>,
     tickers: Arc<DashMap<String, TickerState>>,
     orderbooks: Arc<DashMap<String, OrderbookState>>,
-    signals: Arc<Mutex<std::vec::Vec<SignalEvent>>>,
+    signals: Arc<Mutex<Vec<SignalEvent>>>,
     signalled_pairs: Arc<DashMap<String, bool>>,
     weights: Arc<Mutex<ScoreWeights>>,
     manual_trader: Arc<Mutex<ManualTraderState>>,
@@ -678,12 +762,12 @@ impl Engine {
             candles: Arc::new(DashMap::new()),
             tickers: Arc::new(DashMap::new()),
             orderbooks: Arc::new(DashMap::new()),
-            signals: Arc::new(Mutex::new(std::vec::Vec::new())),
+            signals: Arc::new(Mutex::new(Vec::new())),
             signalled_pairs: Arc::new(DashMap::new()),
             weights: Arc::new(Mutex::new(ScoreWeights::default())),
             manual_trader: Arc::new(Mutex::new(ManualTraderState::new())),
             news_sentiment: Arc::new(DashMap::new()),
-            stars_history: Arc::new(Mutex::new(StarsHistory { history: std::vec::Vec::new(), dirty: false })),
+            stars_history: Arc::new(Mutex::new(StarsHistory { history: Vec::new(), dirty: false })),
         }
     }
 
@@ -1227,7 +1311,6 @@ impl Engine {
                     whale_side: whale_side.clone(),
                     whale_volume,
                     whale_notional,
-                    total_score,
                     analysis: Self::build_analysis(&Row { 
                         pair: pair.to_string(), 
                         price, 
@@ -1262,6 +1345,73 @@ impl Engine {
                     reliability_score: Self::compute_reliability(&t, ts_int).0,
                     reliability_label: Self::compute_reliability(&t, ts_int).1,
                     signal_type: "WH_PRED".to_string(),
+                    confidence: compute_confidence(&Row { 
+                        pair: pair.to_string(), 
+                        price, 
+                        pct, 
+                        whale: is_whale, 
+                        whale_side: whale_side.clone(), 
+                        whale_volume, 
+                        whale_notional, 
+                        flow_pct, 
+                        dir: dir.clone(), 
+                        early: new_early.clone(), 
+                        alpha: new_alpha.clone(), 
+                        pump_score, 
+                        pump_label: pump_label.clone(), 
+                        trades: t.trade_count, 
+                        buys: t.buy_volume, 
+                        sells: t.sell_volume, 
+                        o: c.open.unwrap_or(0.0), 
+                        h: c.high.unwrap_or(0.0), 
+                        l: c.low.unwrap_or(0.0), 
+                        c: c.close.unwrap_or(0.0), 
+                        score: total_score, 
+                        rating: rating.clone(), 
+                        whale_pred_score, 
+                        whale_pred_label: whale_pred_label.clone(), 
+                        reliability_score: Self::compute_reliability(&t, ts_int).0, 
+                        reliability_label: Self::compute_reliability(&t, ts_int).1, 
+                        news_sentiment: t.news_sentiment 
+                    }, t.trade_count as usize, Self::compute_reliability(&t, ts_int).0),
+                    momentum: compute_momentum(pct, pump_score, flow_pct),
+                    trade_score: compute_trade_score(
+                        compute_momentum(pct, pump_score, flow_pct),
+                        compute_confidence(&Row { 
+                            pair: pair.to_string(), 
+                            price, 
+                            pct, 
+                            whale: is_whale, 
+                            whale_side: whale_side.clone(), 
+                            whale_volume, 
+                            whale_notional, 
+                            flow_pct, 
+                            dir: dir.clone(), 
+                            early: new_early.clone(), 
+                            alpha: new_alpha.clone(), 
+                            pump_score, 
+                            pump_label: pump_label.clone(), 
+                            trades: t.trade_count, 
+                            buys: t.buy_volume, 
+                            sells: t.sell_volume, 
+                            o: c.open.unwrap_or(0.0), 
+                            h: c.high.unwrap_or(0.0), 
+                            l: c.low.unwrap_or(0.0), 
+                            c: c.close.unwrap_or(0.0), 
+                            score: total_score, 
+                            rating: rating.clone(), 
+                            whale_pred_score, 
+                            whale_pred_label: whale_pred_label.clone(), 
+                            reliability_score: Self::compute_reliability(&t, ts_int).0, 
+                            reliability_label: Self::compute_reliability(&t, ts_int).1, 
+                            news_sentiment: t.news_sentiment 
+                        }, t.trade_count as usize, Self::compute_reliability(&t, ts_int).0),
+                        Self::compute_reliability(&t, ts_int).0,
+                        whale_pred_score,
+                        pump_score,
+                        flow_pct,
+                        pct,
+                    ),
                 };
                 self.add_to_stars_history(row);
             } else {
@@ -1340,7 +1490,7 @@ impl Engine {
                 strength: notional,
                 flow_pct,
                 pct,
-                whale: true,
+                whale: is_whale,
                 whale_side: side.to_string(),
                 volume,
                 notional,
@@ -1537,7 +1687,6 @@ impl Engine {
                     whale_side: whale_side.clone(),
                     whale_volume,
                     whale_notional,
-                    total_score,
                     analysis: Self::build_analysis(&Row { 
                         pair: pair.to_string(), 
                         price, 
@@ -1572,6 +1721,73 @@ impl Engine {
                     reliability_score,
                     reliability_label: Self::compute_reliability(&t, ts_int).1,
                     signal_type: "ANOM".to_string(),
+                    confidence: compute_confidence(&Row { 
+                        pair: pair.to_string(), 
+                        price, 
+                        pct, 
+                        whale: is_whale, 
+                        whale_side: whale_side.clone(), 
+                        whale_volume, 
+                        whale_notional, 
+                        flow_pct, 
+                        dir: dir.clone(), 
+                        early: new_early.clone(), 
+                        alpha: new_alpha.clone(), 
+                        pump_score, 
+                        pump_label: pump_label.clone(), 
+                        trades: t.trade_count, 
+                        buys: t.buy_volume, 
+                        sells: t.sell_volume, 
+                        o: c.open.unwrap_or(0.0), 
+                        h: c.high.unwrap_or(0.0), 
+                        l: c.low.unwrap_or(0.0), 
+                        c: c.close.unwrap_or(0.0), 
+                        score: total_score, 
+                        rating: rating.clone(), 
+                        whale_pred_score, 
+                        whale_pred_label: whale_pred_label.clone(), 
+                        reliability_score, 
+                        reliability_label: Self::compute_reliability(&t, ts_int).1, 
+                        news_sentiment: t.news_sentiment 
+                    }, t.trade_count as usize, Self::compute_reliability(&t, ts_int).0),
+                    momentum: compute_momentum(pct, pump_score, t.last_flow_pct),
+                    trade_score: compute_trade_score(
+                        compute_momentum(pct, pump_score, t.last_flow_pct),
+                        compute_confidence(&Row { 
+                            pair: pair.to_string(), 
+                            price, 
+                            pct, 
+                            whale: is_whale, 
+                            whale_side: whale_side.clone(), 
+                            whale_volume, 
+                            whale_notional, 
+                            flow_pct, 
+                            dir: dir.clone(), 
+                            early: new_early.clone(), 
+                            alpha: new_alpha.clone(), 
+                            pump_score, 
+                            pump_label: pump_label.clone(), 
+                            trades: t.trade_count, 
+                            buys: t.buy_volume, 
+                            sells: t.sell_volume, 
+                            o: c.open.unwrap_or(0.0), 
+                            h: c.high.unwrap_or(0.0), 
+                            l: c.low.unwrap_or(0.0), 
+                            c: c.close.unwrap_or(0.0), 
+                            score: total_score, 
+                            rating: rating.clone(), 
+                            whale_pred_score, 
+                            whale_pred_label: whale_pred_label.clone(), 
+                            reliability_score, 
+                            reliability_label: Self::compute_reliability(&t, ts_int).1, 
+                            news_sentiment: t.news_sentiment 
+                        }, t.trade_count as usize, Self::compute_reliability(&t, ts_int).0),
+                        Self::compute_reliability(&t, ts_int).0,
+                        whale_pred_score,
+                        pump_score,
+                        t.last_flow_pct,
+                        pct,
+                    ),
                 };
                 self.add_to_stars_history(row);
             }
@@ -1704,8 +1920,8 @@ impl Engine {
         (score, label)
     }
 
-    fn snapshot(&self) -> std::vec::Vec<Row> {
-        let mut rows = std::vec::Vec::new();
+    fn snapshot(&self) -> Vec<Row> {
+        let mut rows = Vec::new();
         let now_ts = chrono::Utc::now().timestamp();
 
         for t in self.trades.iter() {
@@ -1807,14 +2023,14 @@ impl Engine {
         rows
     }
 
-    fn signals_snapshot(&self) -> std::vec::Vec<SignalEvent> {
+    fn signals_snapshot(&self) -> Vec<SignalEvent> {
         let buf = self.signals.lock().unwrap();
-        let mut v: std::vec::Vec<SignalEvent> = buf.iter().cloned().collect();
+        let mut v: Vec<SignalEvent> = buf.iter().cloned().collect();
         v.sort_by(|a, b| b.ts.cmp(&a.ts));
         v
     }
 
-    fn heatmap_snapshot(&self) -> std::vec::Vec<HeatmapPoint> {
+    fn heatmap_snapshot(&self) -> Vec<HeatmapPoint> {
         self.snapshot()
             .into_iter()
             .map(|r| HeatmapPoint {
@@ -1831,9 +2047,9 @@ impl Engine {
             .collect()
     }
 
-    fn backtest_snapshot(&self) -> std::vec::Vec<BacktestResult> {
+    fn backtest_snapshot(&self) -> Vec<BacktestResult> {
         let sigs = self.signals.lock().unwrap();
-        let mut groups: HashMap<(String, String), std::vec::Vec<(i64, f64)>> = HashMap::new();
+        let mut groups: HashMap<(String, String), Vec<(i64, f64)>> = HashMap::new();
 
         for ev in sigs.iter() {
             if !ev.evaluated {
@@ -1845,7 +2061,7 @@ impl Engine {
             }
         }
 
-        let mut out = std::vec::Vec::new();
+        let mut out = Vec::new();
 
         for ((signal_type, direction), mut trades) in groups {
             trades.sort_by_key(|(ts, _)| *ts);
@@ -1854,7 +2070,7 @@ impl Engine {
                 continue;
             }
 
-            let mut equity_curve = std::vec::Vec::with_capacity(n);
+            let mut equity_curve = Vec::with_capacity(n);
             let mut cum = 0.0_f64;
             let mut peak = 0.0_f64;
             let mut max_dd = 0.0_f64;
@@ -1949,7 +2165,7 @@ impl Engine {
 
     fn manual_trades_snapshot(&self) -> ManualTradesResponse {
         let trader = self.manual_trader.lock().unwrap();
-        let mut list = std::vec::Vec::new();
+        let mut list = Vec::new();
         for (pair, trade) in trader.trades.iter() {
             let current_price = self
                 .candles
@@ -1984,7 +2200,7 @@ impl Engine {
     }
 
     fn build_analysis(row: &Row) -> String {
-        let mut parts: std::vec::Vec<String> = std::vec::Vec::new();
+        let mut parts: Vec<String> = Vec::new();
 
         if row.pct > 5.0 {
             parts.push(format!("Prijs is gestegen met {:.1}%.", row.pct));
@@ -2042,6 +2258,34 @@ impl Engine {
             parts.push(format!("Negatieve nieuws sentiment ({:.1}).", row.news_sentiment));
         }
 
+        // NIEUW: Momentum advies
+        let momentum = compute_momentum(row.pct, row.pump_score, row.flow_pct);
+        if momentum > 70.0 {
+            parts.push("Hoog momentum: Koop nu!".to_string());
+        } else if momentum > 50.0 {
+            parts.push("Matig momentum: Overweeg koop.".to_string());
+        } else {
+            parts.push("Laag momentum: Wacht.".to_string());
+        }
+
+        // NIEUW: Trade Score advies
+        let trade_score = compute_trade_score(
+            momentum,
+            compute_confidence(row, row.trades as usize, row.reliability_score),
+            row.reliability_score,
+            row.whale_pred_score,
+            row.pump_score,
+            row.flow_pct,
+            row.pct,
+        );
+        if trade_score > 80.0 {
+            parts.push("Sterk koop signaal: Trade nu!".to_string());
+        } else if trade_score > 60.0 {
+            parts.push("Matig koop: Overweeg met SL.".to_string());
+        } else {
+            parts.push("Vermijd: Te risicovol.".to_string());
+        }
+
         if parts.is_empty() {
             parts.push("Neutrale marktcondities.".to_string());
         }
@@ -2052,73 +2296,29 @@ impl Engine {
     fn top10_snapshot(&self) -> Top10Response {
         let rows = self.snapshot();
 
-        let get_last_signal_type = |pair: &str| -> String {
-            let signals = self.signals.lock().unwrap();
-            signals.iter().rev().find(|s| s.pair == pair).map(|s| s.signal_type.clone()).unwrap_or_else(|| "NONE".to_string())
-        };
-
-        let mut risers: std::vec::Vec<TopRow> = rows
+        let mut risers: Vec<TopRow> = rows
             .iter()
             .filter(|r| r.dir == "BUY" && r.pct > 0.0)
-            .map(|r| TopRow {
-                ts: self
-                    .trades
-                    .get(&r.pair)
-                    .map(|t| t.last_update_ts)
-                    .unwrap_or(0),
-                pair: r.pair.clone(),
-                price: r.price,
-                pct: r.pct,
-                flow_pct: r.flow_pct,
-                dir: r.dir.clone(),
-                early: r.early.clone(),
-                alpha: r.alpha.clone(),
-                pump_score: r.pump_score,
-                pump_label: r.pump_label.clone(),
-                whale: r.whale,
-                whale_side: r.whale_side.clone(),
-                whale_volume: r.whale_volume,
-                whale_notional: r.whale_notional,
-                total_score: r.score,
-                analysis: Self::build_analysis(r),
-                whale_pred_score: r.whale_pred_score,
-                whale_pred_label: r.whale_pred_label.clone(),
-                reliability_score: r.reliability_score,
-                reliability_label: r.reliability_label.clone(),
-                signal_type: get_last_signal_type(&r.pair),
-            })
-            .collect();
-
-        let mut best3 = risers.clone();
-        best3.sort_by(|a, b| {
-            let sa = a.total_score + a.pump_score * 1.5 + a.whale_pred_score * 1.0;
-            let sb = b.total_score + b.pump_score * 1.5 + b.whale_pred_score * 1.0;
-            sb.partial_cmp(&sa).unwrap()
-        });
-        if best3.len() > 3 {
-            best3.truncate(3);
-        }
-
-        risers.sort_by(|a, b| {
-            let sa = a.total_score + a.pump_score * 1.5 + a.whale_pred_score * 1.0;
-            let sb = b.total_score + b.pump_score * 1.5 + b.whale_pred_score * 1.0;
-            sb.partial_cmp(&sa).unwrap()
-        });
-        if risers.len() > 10 {
-            risers.truncate(10);
-        }
-
-        let mut fallers: std::vec::Vec<TopRow> = rows
-            .iter()
-            .filter(|r| r.dir == "SELL" && r.pct < 0.0)
             .map(|r| {
-                let pct_down = (-r.pct).max(0.0);
-                let flow_sell = if r.flow_pct > 50.0 {
-                    r.flow_pct - 50.0
+                let trades_count = self.trades.get(&r.pair).map(|t| t.trade_count).unwrap_or(0);
+                let rel_score = r.reliability_score;
+                let confidence = compute_confidence(r, trades_count as usize, rel_score);
+
+                let signal_type = if confidence < 30.0 || rel_score < 50.0 || trades_count < 5 {
+                    "UNCERTAIN".to_string()
+                } else if r.whale {
+                    "WHALE".to_string()
+                } else if r.alpha == "BUY" {
+                    "ALPHA".to_string()
+                } else if r.early == "BUY" {
+                    "EARLY".to_string()
+                } else if r.whale_pred_label == "HIGH" {
+                    "WH_PRED".to_string()
+                } else if !r.pump_label.is_empty() && r.pump_label != "NONE" {
+                    r.pump_label.clone()
                 } else {
-                    0.0
+                    "NONE".to_string()
                 };
-                let total_score = pct_down * 0.5 + flow_sell * 0.1;
 
                 TopRow {
                     ts: self
@@ -2139,18 +2339,115 @@ impl Engine {
                     whale_side: r.whale_side.clone(),
                     whale_volume: r.whale_volume,
                     whale_notional: r.whale_notional,
-                    total_score,
                     analysis: Self::build_analysis(r),
                     whale_pred_score: r.whale_pred_score,
                     whale_pred_label: r.whale_pred_label.clone(),
                     reliability_score: r.reliability_score,
                     reliability_label: r.reliability_label.clone(),
-                    signal_type: get_last_signal_type(&r.pair),
+                    signal_type,
+                    confidence,
+                    momentum: compute_momentum(r.pct, r.pump_score, r.flow_pct),
+                    trade_score: compute_trade_score(
+                        compute_momentum(r.pct, r.pump_score, r.flow_pct),
+                        confidence,
+                        rel_score,
+                        r.whale_pred_score,
+                        r.pump_score,
+                        r.flow_pct,
+                        r.pct,
+                    ),
                 }
             })
             .collect();
 
-        fallers.sort_by(|a, b| b.total_score.partial_cmp(&a.total_score).unwrap());
+        let mut best3 = risers.clone();
+        best3.sort_by(|a, b| {
+            let sa = a.trade_score + a.pump_score * 1.5 + a.whale_pred_score * 1.0;
+            let sb = b.trade_score + b.pump_score * 1.5 + b.whale_pred_score * 1.0;
+            sb.partial_cmp(&sa).unwrap()
+        });
+        if best3.len() > 3 {
+            best3.truncate(3);
+        }
+
+        risers.sort_by(|a, b| {
+            let sa = a.trade_score + a.pump_score * 1.5 + a.whale_pred_score * 1.0;
+            let sb = b.trade_score + b.pump_score * 1.5 + b.whale_pred_score * 1.0;
+            sb.partial_cmp(&sa).unwrap()
+        });
+        if risers.len() > 10 {
+            risers.truncate(10);
+        }
+
+        let mut fallers: Vec<TopRow> = rows
+            .iter()
+            .filter(|r| r.dir == "SELL" && r.pct < 0.0)
+            .map(|r| {
+                let pct_down = (-r.pct).max(0.0);
+                let flow_sell = if r.flow_pct > 50.0 {
+                    r.flow_pct - 50.0
+                } else {
+                    0.0
+                };
+                let _total_score = pct_down * 0.5 + flow_sell * 0.1;
+
+                let trades_count = self.trades.get(&r.pair).map(|t| t.trade_count).unwrap_or(0);
+                let rel_score = r.reliability_score;
+                let confidence = compute_confidence(r, trades_count as usize, rel_score);
+
+                let signal_type = if confidence < 30.0 || rel_score < 50.0 || trades_count < 5 {
+                    "UNCERTAIN".to_string()
+                } else if r.whale {
+                    "WHALE".to_string()
+                } else if r.alpha == "SELL" {
+                    "ALPHA".to_string()
+                } else if r.early == "SELL" {
+                    "EARLY".to_string()
+                } else {
+                    "NONE".to_string()
+                };
+
+                TopRow {
+                    ts: self
+                        .trades
+                        .get(&r.pair)
+                        .map(|t| t.last_update_ts)
+                        .unwrap_or(0),
+                    pair: r.pair.clone(),
+                    price: r.price,
+                    pct: r.pct,
+                    flow_pct: r.flow_pct,
+                    dir: r.dir.clone(),
+                    early: r.early.clone(),
+                    alpha: r.alpha.clone(),
+                    pump_score: r.pump_score,
+                    pump_label: r.pump_label.clone(),
+                    whale: r.whale,
+                    whale_side: r.whale_side.clone(),
+                    whale_volume: r.whale_volume,
+                    whale_notional: r.whale_notional,
+                    analysis: Self::build_analysis(r),
+                    whale_pred_score: r.whale_pred_score,
+                    whale_pred_label: r.whale_pred_label.clone(),
+                    reliability_score: r.reliability_score,
+                    reliability_label: r.reliability_label.clone(),
+                    signal_type,
+                    confidence,
+                    momentum: compute_momentum(r.pct, r.pump_score, r.flow_pct),
+                    trade_score: compute_trade_score(
+                        compute_momentum(r.pct, r.pump_score, r.flow_pct),
+                        confidence,
+                        rel_score,
+                        r.whale_pred_score,
+                        r.pump_score,
+                        r.flow_pct,
+                        r.pct,
+                    ),
+                }
+            })
+            .collect();
+
+        fallers.sort_by(|a, b| b.trade_score.partial_cmp(&a.trade_score).unwrap());
         if fallers.len() > 10 {
             fallers.truncate(10);
         }
@@ -2227,7 +2524,7 @@ fn normalize_asset(sym: &str) -> String {
 }
 
 fn normalize_pair(wsname: &str) -> String {
-    let parts: std::vec::Vec<&str> = wsname.split('/').collect();
+    let parts: Vec<&str> = wsname.split('/').collect();
     if parts.len() != 2 {
         return wsname.to_string();
     }
@@ -2237,7 +2534,7 @@ fn normalize_pair(wsname: &str) -> String {
 }
 
 // ============================================================================
-// HOOFDSTUK 9 – FRONTEND (HTML DASHBOARD) (AANGEPAST VOOR STARS HISTORIE)
+// HOOFDSTUK 9 – FRONTEND (HTML DASHBOARD) – AANGEPAST VOOR CONFIDENCE + MOMENTUM + TRADE SCORE
 // ============================================================================
 
 const DASHBOARD_HTML: &str = r####"<!DOCTYPE html>
@@ -2279,6 +2576,7 @@ tr:nth-child(even){ background:#252525; }
 .signal_type_EARLY_PUMP { color:#00bcd4; }
 .signal_type_MEGA_PUMP { color:#ff4081; }
 .signal_type_WH_PRED { color:#00bcd4; }
+.signal_type_UNCERTAIN { color:#9e9e9e; }
 .signal_dir_BUY { color:#00e676; }
 .signal_dir_SELL { color:#ff1744; }
 .flow-bar {
@@ -2395,8 +2693,8 @@ tr:nth-child(even){ background:#252525; }
       <thead>
         <tr>
           <th>Time</th><th>Pair</th><th>Price</th><th>%</th><th>Flow</th><th>Dir</th>
-          <th>Early</th><th>Alpha</th><th>Whale</th><th>Total score</th><th>Pump</th>
-          <th>WhPred</th><th>Rel</th><th>Type</th><th>Visual</th><th>Analyse</th>
+          <th>Early</th><th>Alpha</th><th>Whale</th><th>Pump</th>
+          <th>WhPred</th><th>Rel</th><th>Type</th><th>Confidence</th><th>Momentum</th><th>Trade Score</th><th>Visual</th><th>Analyse</th>
         </tr>
       </thead>
       <tbody></tbody>
@@ -2407,8 +2705,8 @@ tr:nth-child(even){ background:#252525; }
       <thead>
         <tr>
           <th>Time</th><th>Pair</th><th>Price</th><th>%</th><th>Flow</th><th>Dir</th>
-          <th>Early</th><th>Alpha</th><th>Whale</th><th>Total score</th><th>Pump</th>
-          <th>WhPred</th><th>Rel</th><th>Type</th><th>Visual</th><th>Analyse</th>
+          <th>Early</th><th>Alpha</th><th>Whale</th><th>Pump</th>
+          <th>WhPred</th><th>Rel</th><th>Type</th><th>Confidence</th><th>Momentum</th><th>Trade Score</th><th>Visual</th><th>Analyse</th>
         </tr>
       </thead>
       <tbody></tbody>
@@ -2419,8 +2717,8 @@ tr:nth-child(even){ background:#252525; }
       <thead>
         <tr>
           <th>Time</th><th>Pair</th><th>Price</th><th>%</th><th>Flow</th><th>Dir</th>
-          <th>Early</th><th>Alpha</th><th>Whale</th><th>Total score</th><th>Pump</th>
-          <th>Rel</th><th>Visual</th><th>Analyse</th>
+          <th>Early</th><th>Alpha</th><th>Whale</th><th>Pump</th>
+          <th>Rel</th><th>Type</th><th>Confidence</th><th>Momentum</th><th>Trade Score</th><th>Visual</th><th>Analyse</th>
         </tr>
       </thead>
       <tbody></tbody>
@@ -2560,8 +2858,8 @@ tr:nth-child(even){ background:#252525; }
       <thead>
         <tr>
           <th>Time</th><th>Pair</th><th>Price</th><th>%</th><th>Flow</th><th>Dir</th>
-          <th>Early</th><th>Alpha</th><th>Whale</th><th>Total score</th><th>Pump</th>
-          <th>WhPred</th><th>Rel</th><th>Type</th><th>Visual</th><th>Analyse</th>
+          <th>Early</th><th>Alpha</th><th>Whale</th><th>Pump</th>
+          <th>WhPred</th><th>Rel</th><th>Type</th><th>Confidence</th><th>Momentum</th><th>Trade Score</th><th>Visual</th><th>Analyse</th>
         </tr>
       </thead>
       <tbody></tbody>
@@ -2571,8 +2869,8 @@ tr:nth-child(even){ background:#252525; }
       <thead>
         <tr>
           <th>Time</th><th>Pair</th><th>Price</th><th>%</th><th>Flow</th><th>Dir</th>
-          <th>Early</th><th>Alpha</th><th>Whale</th><th>Total score</th><th>Pump</th>
-          <th>WhPred</th><th>Rel</th><th>Type</th><th>Visual</th><th>Analyse</th>
+          <th>Early</th><th>Alpha</th><th>Whale</th><th>Pump</th>
+          <th>WhPred</th><th>Rel</th><th>Type</th><th>Confidence</th><th>Momentum</th><th>Trade Score</th><th>Visual</th><th>Analyse</th>
         </tr>
       </thead>
       <tbody></tbody>
@@ -2696,6 +2994,11 @@ tr:nth-child(even){ background:#252525; }
         <li><b>Alpha</b>: sterkste combinatie van trend, volume, whales en anomalies (alleen bij BUY).</li>
         <li><b>Pump</b>: gecombineerde score van korte en middellange termijn prijsimpuls + flow.</li>
         <li><b>WhPred</b>: kans op aankomende whale (LOW / MEDIUM / HIGH).</li>
+        <li><b>Rel</b>: betrouwbaarheidsscore (0-100), gebaseerd op recente trades en volume.</li>
+        <li><b>Type</b>: signal type (ALPHA, EARLY, WHALE, etc.), aangepast voor betrouwbaarheid.</li>
+        <li><b>Confidence</b>: gecombineerde score (0-100%) voor hoe betrouwbaar het signaal is.</li>
+        <li><b>Momentum</b>: koopmoment score (0-100%) gebaseerd op %, Pump en Flow.</li>
+        <li><b>Trade Score</b>: holistische beslissingscore (0-100%) voor koop/vermijd, met risico-penaliteiten.</li>
         <li><b>News Sent.</b>: sentiment van recente nieuwsartikelen (0-1).</li>
         <li><b>Visual</b>: link naar de bijbehorende Kraken Pro grafiek.</li>
       </ul>
@@ -2943,7 +3246,7 @@ async function loadTop10() {
     return d.toLocaleTimeString();
   }
 
-  function renderRow(r) {
+  function renderRow(r, isFallers = false) {
     let pctClass = r.pct > 0 ? "pos" : (r.pct < 0 ? "neg" : "");
     let flowColor = r.dir === "BUY" ? "#4caf50" : "#f44336";
     let whaleText = r.whale
@@ -2964,31 +3267,64 @@ async function loadTop10() {
     else if (r.reliability_label === "LOW") relClass = "rel_low";
     else relClass = "rel_bad";
 
-    return `<tr>
-      <td>${fmtTime(r.ts)}</td>
-      <td>${r.pair}</td>
-      <td>${r.price.toFixed(4)}</td>
-      <td class="${pctClass}">${r.pct.toFixed(2)}%</td>
-      <td>
-        <div class="flow-bar">
-          <div class="flow-fill" style="width:${r.flow_pct.toFixed(0)}%;background:${flowColor};"></div>
-        </div>
-        ${r.flow_pct.toFixed(1)}%
-      </td>
-      <td>${r.dir}</td>
-      <td>${r.early}</td>
-      <td>${r.alpha}</td>
-      <td>${whaleText}</td>
-      <td>${r.total_score.toFixed(2)}</td>
-      <td style="color:${ r.pump_label === "MEGA_PUMP" ? "#ff4081" :
-        r.pump_label === "EARLY_PUMP" ? "#00bcd4" :
-        "#ccc"}">${r.pump_score.toFixed(1)}</td>
-      <td class="${predClass}">${r.whale_pred_label} (${r.whale_pred_score.toFixed(1)})</td>
-      <td class="${relClass}">${r.reliability_label} (${r.reliability_score.toFixed(0)})</td>
-      <td class="signal_type signal_type_${r.signal_type}">${r.signal_type}</td>
-      <td>${visual}</td>
-      <td>${r.analysis}</td>
-    </tr>`;
+    let typeClass = "signal_type signal_type_" + r.signal_type;
+
+    if (isFallers) {
+      return `<tr>
+        <td>${fmtTime(r.ts)}</td>
+        <td>${r.pair}</td>
+        <td>${r.price.toFixed(4)}</td>
+        <td class="${pctClass}">${r.pct.toFixed(2)}%</td>
+        <td>
+          <div class="flow-bar">
+            <div class="flow-fill" style="width:${r.flow_pct.toFixed(0)}%;background:${flowColor};"></div>
+          </div>
+          ${r.flow_pct.toFixed(1)}%
+        </td>
+        <td>${r.dir}</td>
+        <td>${r.early}</td>
+        <td>${r.alpha}</td>
+        <td>${whaleText}</td>
+        <td style="color:${ r.pump_label === "MEGA_PUMP" ? "#ff4081" :
+          r.pump_label === "EARLY_PUMP" ? "#00bcd4" :
+          "#ccc"}">${r.pump_score.toFixed(1)}</td>
+        <td class="${relClass}">${r.reliability_label} (${r.reliability_score.toFixed(0)})</td>
+        <td class="${typeClass}">${r.signal_type}</td>
+        <td>${r.confidence.toFixed(1)}%</td>
+        <td>${r.momentum.toFixed(1)}%</td>
+        <td>${r.trade_score.toFixed(1)}</td>
+        <td>${visual}</td>
+        <td>${r.analysis}</td>
+      </tr>`;
+    } else {
+      return `<tr>
+        <td>${fmtTime(r.ts)}</td>
+        <td>${r.pair}</td>
+        <td>${r.price.toFixed(4)}</td>
+        <td class="${pctClass}">${r.pct.toFixed(2)}%</td>
+        <td>
+          <div class="flow-bar">
+            <div class="flow-fill" style="width:${r.flow_pct.toFixed(0)}%;background:${flowColor};"></div>
+          </div>
+          ${r.flow_pct.toFixed(1)}%
+        </td>
+        <td>${r.dir}</td>
+        <td>${r.early}</td>
+        <td>${r.alpha}</td>
+        <td>${whaleText}</td>
+        <td style="color:${ r.pump_label === "MEGA_PUMP" ? "#ff4081" :
+          r.pump_label === "EARLY_PUMP" ? "#00bcd4" :
+          "#ccc"}">${r.pump_score.toFixed(1)}</td>
+        <td class="${predClass}">${r.whale_pred_label} (${r.whale_pred_score.toFixed(1)})</td>
+        <td class="${relClass}">${r.reliability_label} (${r.reliability_score.toFixed(0)})</td>
+        <td class="${typeClass}">${r.signal_type}</td>
+        <td>${r.confidence.toFixed(1)}%</td>
+        <td>${r.momentum.toFixed(1)}%</td>
+        <td>${r.trade_score.toFixed(1)}</td>
+        <td>${visual}</td>
+        <td>${r.analysis}</td>
+      </tr>`;
+    }
   }
 
   for (let r of data.best3.filter(row => includeStable || !isStablecoin(row.pair))) {
@@ -3000,7 +3336,7 @@ async function loadTop10() {
   }
 
   for (let r of data.fallers.filter(row => includeStable || !isStablecoin(row.pair))) {
-    downBody.innerHTML += renderRow(r);
+    downBody.innerHTML += renderRow(r, true);
   }
   applyDirFilter('top3', 'top10-dir-filter', 5);
   applyDirFilter('top10-up', 'top10-dir-filter', 5);
@@ -3432,6 +3768,7 @@ async function loadStars() {
             let relClass = r.reliability_label === "HIGH" ? "rel_high" :
               (r.reliability_label === "MEDIUM" ? "rel_med" :
               (r.reliability_label === "LOW" ? "rel_low" : "rel_bad"));
+            let typeClass = "signal_type signal_type_" + r.signal_type;
             return `<tr>
               <td>${fmtTime(r.ts)}</td>
               <td>${r.pair}</td>
@@ -3447,13 +3784,15 @@ async function loadStars() {
               <td>${r.early}</td>
               <td>${r.alpha}</td>
               <td>${whaleText}</td>
-              <td>${r.total_score.toFixed(2)}</td>
               <td style="color:${ r.pump_label === "MEGA_PUMP" ? "#ff4081" :
                 r.pump_label === "EARLY_PUMP" ? "#00bcd4" :
                 "#ccc"}">${r.pump_score.toFixed(1)}</td>
               <td class="${predClass}">${r.whale_pred_label} (${r.whale_pred_score.toFixed(1)})</td>
               <td class="${relClass}">${r.reliability_label} (${r.reliability_score.toFixed(0)})</td>
-              <td class="signal_type signal_type_${r.signal_type}">${r.signal_type}</td>
+              <td class="${typeClass}">${r.signal_type}</td>
+              <td>${r.confidence.toFixed(1)}%</td>
+              <td>${r.momentum.toFixed(1)}%</td>
+              <td>${r.trade_score.toFixed(1)}</td>
               <td>${visual}</td>
               <td>${r.analysis}</td>
             </tr>`;
@@ -3610,7 +3949,9 @@ window.addEventListener("load", () => {
       if (el.type === 'checkbox') {
         cfg[el.id] = el.checked;
       } else if (el.type === 'number') {
-        cfg[el.id] = parseFloat(el.value);
+        // FIX: Vervang komma door punt voor parseFloat
+        let val = el.value.replace(',', '.');
+        cfg[el.id] = parseFloat(val);
       } else {
         cfg[el.id] = el.value;
       }
@@ -3680,7 +4021,7 @@ tick();
 
 async fn run_kraken_worker(
     engine: Engine,
-    ws_pairs: std::vec::Vec<String>,
+    ws_pairs: Vec<String>,
     worker_id: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let url = "wss://ws.kraken.com";
@@ -3773,7 +4114,7 @@ async fn run_kraken_worker(
 
 async fn run_orderbook_worker(
     engine: Engine,
-    ws_pairs: std::vec::Vec<String>,
+    ws_pairs: Vec<String>,
     worker_id: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let url = "wss://ws.kraken.com";
@@ -3844,8 +4185,8 @@ async fn run_orderbook_worker(
                             // Parse orderbook data
                             if let Some(data) = arr.get(1).and_then(|v| v.as_object()) {
                                 let ts_int = chrono::Utc::now().timestamp();
-                                let mut bids: std::vec::Vec<(f64, f64)> = std::vec::Vec::new();
-                                let mut asks: std::vec::Vec<(f64, f64)> = std::vec::Vec::new();
+                                let mut bids: Vec<(f64, f64)> = Vec::new();
+                                let mut asks: Vec<(f64, f64)> = Vec::new();
 
                                 // Parse bids (either 'b' or 'bs')
                                 if let Some(bid_arr) = data.get("b").or_else(|| data.get("bs")) {
@@ -3930,7 +4271,7 @@ async fn run_orderbook_worker(
 
 async fn run_anomaly_scanner(
     engine: Engine,
-    kraken_keys: std::vec::Vec<String>,
+    kraken_keys: Vec<String>,
     key_to_norm: HashMap<String, String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!(
@@ -3938,14 +4279,18 @@ async fn run_anomaly_scanner(
         kraken_keys.len()
     );
 
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+
     loop {
         for chunk in kraken_keys.chunks(20) {
-            let keys: std::vec::Vec<String> = chunk.iter().cloned().collect();
+            let keys: Vec<String> = chunk.iter().cloned().collect();
             let joined = keys.join(",");
             let url =
                 format!("https://api.kraken.com/0/public/Ticker?pair={}", joined);
 
-            if let Ok(resp) = reqwest::get(&url).await {
+            if let Ok(resp) = client.get(&url).send().await {
                 if let Ok(json) = resp.json::<Value>().await {
                     if let Some(obj) = json["result"].as_object() {
                         for (k, v) in obj.iter() {
@@ -3985,13 +4330,17 @@ async fn run_anomaly_scanner(
 async fn run_news_scanner(engine: Engine) -> Result<(), Box<dyn std::error::Error>> {
     println!("Starting news sentiment scanner...");
 
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+
     let mut processed_titles: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     loop {
         // Voorbeeld: RSS feed van een crypto nieuws site (bijv. CoinDesk)
         let rss_url = "https://cointelegraph.com/rss";
 
-        if let Ok(resp) = reqwest::get(rss_url).await {
+        if let Ok(resp) = client.get(rss_url).send().await {
             if let Ok(content) = resp.text().await {
                 if let Ok(channel) = Channel::read_from(Cursor::new(content.as_bytes())) {
                     for item in channel.items {
@@ -4148,13 +4497,13 @@ async fn run_self_evaluator(engine: Engine) {
 }
 
 // ============================================================================
-// HOOFDSTUK 13 – CLEANUP & ONDERHOUD
+// HOOFDSTUK 13 – CLEANUP & ONDERHOUD (AGRESSIEVER GEMAAKT)
 // ============================================================================
 
 
 async fn run_cleanup(engine: Engine) {
     loop {
-        sleep(Duration::from_secs(600)).await;
+        sleep(Duration::from_secs(600)).await; // Nog steeds elke 10 min, maar agressiever
 
         let now = Utc::now().timestamp();
         let cutoff_trades = now - 12 * 3600;
@@ -4163,7 +4512,7 @@ async fn run_cleanup(engine: Engine) {
 
         engine.trades.retain(|_, v| v.last_update_ts >= cutoff_trades);
 
-        let mut to_reset = std::vec::Vec::new();
+        let mut to_reset = Vec::new();
         for c in engine.candles.iter() {
             let last_ts = c.last_ts.unwrap_or(0);
             if last_ts < cutoff_candles {
@@ -4195,8 +4544,60 @@ async fn run_cleanup(engine: Engine) {
     }
 }
 
+// NIEUW: Agressieve cleanup elke 5 minuten
+async fn run_aggressive_cleanup(engine: Engine) {
+    let mut interval = interval(Duration::from_secs(300)); // Elke 5 minuten
+    loop {
+        interval.tick().await;
+        let now = Utc::now().timestamp();
+
+        // Log sizes voor debugging
+        let trades_count: usize = engine.trades.iter().map(|_| 1).sum();
+        let candles_count: usize = engine.candles.iter().map(|_| 1).sum();
+        let signals_count = engine.signals.lock().unwrap().len();
+        let stars_count = engine.stars_history.lock().unwrap().history.len();
+        println!("[HEALTH] trades: {}, candles: {}, signals: {}, stars: {}", trades_count, candles_count, signals_count, stars_count);
+
+        // Cleanup trades: verwijder oude pairs volledig na 6 uur inactiviteit
+        let cutoff_old = now - 6 * 3600;
+        engine.trades.retain(|_, v| v.last_update_ts >= cutoff_old);
+
+        // Cleanup candles: max 500 entries totaal
+        let mut candle_keys: Vec<String> = engine.candles.iter().map(|k| k.key().clone()).collect();
+        if candle_keys.len() > 500 {
+            candle_keys.sort_by_key(|k| engine.candles.get(k).map(|c| c.last_update_ts).unwrap_or(0));
+            for key in candle_keys.iter().take(candle_keys.len() - 500) {
+                engine.candles.remove(key);
+            }
+        }
+
+        // Signals: max 200 (strenger dan 400)
+        let mut sigs = engine.signals.lock().unwrap();
+        let sigs_len = sigs.len();
+        if sigs_len > 200 {
+            sigs.drain(0..(sigs_len - 200));
+        }
+        drop(sigs);
+
+        // Stars: max 500 entries (minder dan 1000)
+        let mut history = engine.stars_history.lock().unwrap();
+        let history_len = history.history.len();
+        if history_len > 500 {
+            history.history.drain(0..(history_len - 500));
+            history.dirty = true; // Markeer voor save
+        }
+        drop(history);
+
+        // Orderbooks: max 100 recente
+        let cutoff_ob = now - 120; // 2 minuten
+        engine.orderbooks.retain(|_, v| v.timestamp >= cutoff_ob);
+
+        println!("[CLEANUP] Aggressive cleanup done");
+    }
+}
+
 // ============================================================================
-// HOOFDSTUK 14 – HTTP SERVER & API
+// HOOFDSTUK 14 – HTTP SERVER & API (MET HEALTH ENDPOINT)
 // ============================================================================
 
 
@@ -4264,7 +4665,7 @@ async fn run_http(engine: Engine, config: Arc<Mutex<AppConfig>>) {
     let api_news = warp::path!("api" / "news")
         .and(engine_filter.clone())
         .map(|engine: Engine| {
-            let mut news_data = std::vec::Vec::new();
+            let mut news_data = Vec::new();
             for ns in engine.news_sentiment.iter() {
                 let pair = ns.key().clone();
                 let value = ns.value();
@@ -4290,6 +4691,16 @@ async fn run_http(engine: Engine, config: Arc<Mutex<AppConfig>>) {
             sorted_history.sort_by(|a, b| b.ts.cmp(&a.ts));
             warp::reply::json(&sorted_history)
         });
+
+    // NIEUW: Health endpoint
+    let api_health = warp::path!("healthz").map(|| {
+        let uptime = Utc::now().timestamp() - *START_TIME;
+        warp::reply::json(&serde_json::json!({
+            "status": "ok",
+            "uptime_sec": uptime,
+            "version": "1.0"
+        }))
+    });
 
     let api_manual_trade_post = warp::path!("api" / "manual_trade")
         .and(warp::post())
@@ -4331,6 +4742,7 @@ async fn run_http(engine: Engine, config: Arc<Mutex<AppConfig>>) {
         .or(api_config_reset)
         .or(api_news)
         .or(api_stars_history)
+        .or(api_health)
         .or(index);
 
     let mut port: u16 = 8080;
@@ -4362,7 +4774,7 @@ async fn run_http(engine: Engine, config: Arc<Mutex<AppConfig>>) {
 }
 
 // ============================================================================
-// HOOFDSTUK 15 – MAIN ENTRYPOINT
+// HOOFDSTUK 15 – MAIN ENTRYPOINT (MET GRACEFUL SHUTDOWN)
 // ============================================================================
 
 
@@ -4380,9 +4792,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .expect("Invalid JSON from Kraken AssetPairs");
     println!("Kraken markets: {}", result.len());
 
-    let mut kraken_keys: std::vec::Vec<String> = std::vec::Vec::new();
+    let mut kraken_keys: Vec<String> = Vec::new();
     let mut key_to_norm: HashMap<String, String> = HashMap::new();
-    let mut ws_pairs: std::vec::Vec<String> = std::vec::Vec::new();
+    let mut ws_pairs: Vec<String> = Vec::new();
 
     for (k, v) in result.iter() {
         if let Some(wsname) = v["wsname"].as_str() {
@@ -4404,7 +4816,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ws_pairs.dedup();
     let total_ws_pairs = ws_pairs.len();
     let chunk_size = 20;
-    let chunks: std::vec::Vec<std::vec::Vec<String>> = ws_pairs.chunks(chunk_size).map(|c| c.to_vec()).collect();
+    let chunks: Vec<Vec<String>> = ws_pairs.chunks(chunk_size).map(|c| c.to_vec()).collect();
 
     println!(
         "Using {} pairs for anomaly scanner (REST), {} EUR pairs via WebSocket trades ({} WS workers)",
@@ -4424,25 +4836,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     engine.load_stars_history().await;
     println!("Loaded stars history");
 
+    // Maak shutdown kanaal
+    let (shutdown_tx, mut shutdown_rx) = broadcast::channel::<()>(1);
+
     let engine_for_ws = engine.clone();
 
     // Clone chunks for orderbook workers
-    let ob_chunks: std::vec::Vec<std::vec::Vec<String>> = ws_pairs.chunks(chunk_size).map(|c| c.to_vec()).collect();
+    let ob_chunks: Vec<Vec<String>> = ws_pairs.chunks(chunk_size).map(|c| c.to_vec()).collect();
 
     // Spawn HTTP server als eerste, zodat direct beschikbaar
     let engine_http = engine.clone();
     let config_http = config.clone();
     tokio::spawn(async move {
-        run_http(engine_http, config_http).await;  // Geen if let Err, want geen Result
+        tokio::select! {
+            _ = run_http(engine_http, config_http) => {},
+            _ = shutdown_rx.recv() => println!("HTTP server shutting down"),
+        }
     });
     println!("HTTP server spawned, should be available soon at http://localhost:8080/");
 
-    // Spawn andere tasks
+    // Spawn andere tasks met shutdown listening
     for (i, chunk) in chunks.into_iter().enumerate() {
         let e = engine_for_ws.clone();
+        let mut rx = shutdown_tx.subscribe();
         tokio::spawn(async move {
-            if let Err(err) = run_kraken_worker(e, chunk, i).await {
-                eprintln!("WS worker {} error: {:?}", i, err);
+            tokio::select! {
+                _ = run_kraken_worker(e, chunk, i) => {},
+                _ = rx.recv() => println!("WS{} shutting down", i),
             }
         });
         sleep(Duration::from_secs(2)).await;
@@ -4451,48 +4871,77 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let engine_for_ob = engine.clone();
     for (i, chunk) in ob_chunks.into_iter().enumerate() {
         let e = engine_for_ob.clone();
+        let mut rx = shutdown_tx.subscribe();
         tokio::spawn(async move {
-            if let Err(err) = run_orderbook_worker(e, chunk, i).await {
-                eprintln!("OB worker {} error: {:?}", i, err);
+            tokio::select! {
+                _ = run_orderbook_worker(e, chunk, i) => {},
+                _ = rx.recv() => println!("OB_WS{} shutting down", i),
             }
         });
         sleep(Duration::from_secs(2)).await;
     }
 
     let engine_anom = engine.clone();
+    let mut rx_anom = shutdown_tx.subscribe();
     tokio::spawn(async move {
-        if let Err(err) = run_anomaly_scanner(engine_anom, kraken_keys, key_to_norm).await {
-            eprintln!("Anomaly scanner error: {}", err);
+        tokio::select! {
+            _ = run_anomaly_scanner(engine_anom, kraken_keys, key_to_norm) => {},
+            _ = rx_anom.recv() => println!("Anomaly scanner shutting down"),
         }
     });
 
     let engine_eval = engine.clone();
+    let mut rx_eval = shutdown_tx.subscribe();
     tokio::spawn(async move {
-        run_self_evaluator(engine_eval).await;  // Dit heeft geen error return, dus geen if
+        tokio::select! {
+            _ = run_self_evaluator(engine_eval) => {},
+            _ = rx_eval.recv() => println!("Self-evaluator shutting down"),
+        }
     });
 
     let engine_cleanup = engine.clone();
+    let mut rx_cleanup = shutdown_tx.subscribe();
     tokio::spawn(async move {
-        run_cleanup(engine_cleanup).await;  // Geen error
+        tokio::select! {
+            _ = run_cleanup(engine_cleanup) => {},
+            _ = rx_cleanup.recv() => println!("Cleanup shutting down"),
+        }
     });
 
     let engine_news = engine.clone();
+    let mut rx_news = shutdown_tx.subscribe();
     tokio::spawn(async move {
-        if let Err(err) = run_news_scanner(engine_news).await {
-            eprintln!("News scanner error: {}", err);
+        tokio::select! {
+            _ = run_news_scanner(engine_news) => {},
+            _ = rx_news.recv() => println!("News scanner shutting down"),
         }
     });
 
     let engine_stars_saver = engine.clone();
+    let mut rx_saver = shutdown_tx.subscribe();
     tokio::spawn(async move {
-        if let Err(err) = run_stars_history_saver(engine_stars_saver).await {
-            eprintln!("Stars saver error: {}", err);
+        tokio::select! {
+            _ = run_stars_history_saver(engine_stars_saver) => {},
+            _ = rx_saver.recv() => println!("Stars saver shutting down"),
         }
     });
 
-    // Wacht op shutdown (bv. Ctrl+C) in plaats van join, zodat app niet stopt bij worker failure
+    // Spawn agressieve cleanup
+    let engine_agg_cleanup = engine.clone();
+    let mut rx_agg = shutdown_tx.subscribe();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = run_aggressive_cleanup(engine_agg_cleanup) => {},
+            _ = rx_agg.recv() => println!("Aggressive cleanup shutting down"),
+        }
+    });
+
+    // Wacht op Ctrl+C en broadcast shutdown
     println!("All tasks spawned. App running. Press Ctrl+C to stop.");
     tokio::signal::ctrl_c().await?;
+    println!("Shutdown signal received, broadcasting to all tasks...");
+    shutdown_tx.send(()).unwrap();
+    sleep(Duration::from_secs(5)).await; // Geef tijd om af te sluiten
     println!("Shutting down...");
     Ok(())
 }
