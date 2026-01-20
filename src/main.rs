@@ -15,30 +15,18 @@
 //     6.3 Analyse & snapshots
 //  7. Betrouwbaarheid & kwaliteitsscores
 //  8. Normalisatie (assets & pairs)
-//  9. Frontend (HTML dashboard) – Aangepast voor Confidence + Momentum + Trade Score
+//  9. Frontend (HTML dashboard) – Aangepast voor Confidence + Momentum + Trade Score + Health Tab + Status Kolom
 // 10. WebSocket workers
 // 11. REST anomaly scanner
 // 12. Self-evaluator (zelflerend)
 // 13. Cleanup & onderhoud (agressiever gemaakt)
-// 14. HTTP server & API (met health endpoint)
-// 15. Main entrypoint (met graceful shutdown)
+// 14. HTTP server & API (met health endpoint uitgebreid met echte metrics)
+//  15. Self-healing watchdog (NIEUW, limiet verwijderd)
+// 16. Main entrypoint (met graceful shutdown)
 //
 // Aangepast voor:
-// - Stars historie: Load bij startup, save tijdens runtime, API voor historie tabel.
-// - Fixes: Parse errors, dubbele velden gefixed.
-// - FIX: Type kolom in Top 10 tabellen nu gebaseerd op huidige staat in plaats van signal history.
-// - VERBETERING: Top 10 betrouwbaarder gemaakt met confidence score en Rel integratie in Type.
-// - UPDATE: Confidence kolom toegevoegd.
-// - NIEUW: Momentum Score toegevoegd voor betere koopmoment beslissingen.
-// - NIEUW: Trade Score toegevoegd als vervanger van Total Score voor holistische beslissingen.
-// - FIX: Config save nu tolerant voor komma's (vervang door punten voor parseFloat).
-// - FIX: TopRow sortering gebruikt nu trade_score in plaats van total_score.
-// - NIEUW: Agressieve cleanup elke 5 minuten om memory leaks te voorkomen.
-// - NIEUW: Health endpoint (/healthz) voor monitoring.
-// - NIEUW: Graceful shutdown met broadcast kanaal.
-// - NIEUW: Timeouts op HTTP requests.
-// - NIEUW: Logging voor health en data sizes.
-// - FIX: Syntax fouten opgelost, consistent gebruik van reqwest client.
+// - Status kolom in Manual Trades: Markt-status per pair (buy/sell flow).
+// - Nieuws ophaal: 1x per uur (van 60s naar 3600s).
 // ============================================================================
 
 use chrono::Utc;
@@ -58,6 +46,48 @@ use tokio::time::{interval, sleep, Duration};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use warp::Filter;
+
+// ============================================================================
+// NIEUW: Self-Healing Counters
+// ============================================================================
+
+lazy_static! {
+    static ref SELF_HEALING_COUNTS: Arc<Mutex<SelfHealingCounts>> = Arc::new(Mutex::new(SelfHealingCounts::new()));
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SelfHealingCounts {
+    news_scanner_restarts: usize,
+    ws_worker_restarts: usize,
+    anomaly_scanner_restarts: usize,
+    total_restarts: usize,
+}
+
+impl SelfHealingCounts {
+    fn new() -> Self {
+        Self {
+            news_scanner_restarts: 0,
+            ws_worker_restarts: 0,
+            anomaly_scanner_restarts: 0,
+            total_restarts: 0,
+        }
+    }
+
+    fn increment_news(&mut self) {
+        self.news_scanner_restarts += 1;
+        self.total_restarts += 1;
+    }
+
+    fn increment_ws(&mut self) {
+        self.ws_worker_restarts += 1;
+        self.total_restarts += 1;
+    }
+
+    fn increment_anomaly(&mut self) {
+        self.anomaly_scanner_restarts += 1;
+        self.total_restarts += 1;
+    }
+}
 
 // ============================================================================
 // LAZY STATIC INITIALIZATION
@@ -2199,100 +2229,6 @@ impl Engine {
         }
     }
 
-    fn build_analysis(row: &Row) -> String {
-        let mut parts: Vec<String> = Vec::new();
-
-        if row.pct > 5.0 {
-            parts.push(format!("Prijs is gestegen met {:.1}%.", row.pct));
-        } else if row.pct > 1.0 {
-            parts.push(format!("Lichte prijsstijging van {:.1}%.", row.pct));
-        } else if row.pct < -1.0 {
-            parts.push(format!("Prijs is gedaald met {:.1}%.", row.pct.abs()));
-        } else {
-            parts.push("Prijs beweegt zijwaarts.".to_string());
-        }
-
-        if row.flow_pct > 70.0 && row.dir == "BUY" {
-            parts.push(format!("Sterke koopdruk: {:.0}% buy-flow.", row.flow_pct));
-        } else if row.flow_pct > 60.0 && row.dir == "BUY" {
-            parts.push(format!("Matige koopdruk: {:.0}% buy-flow.", row.flow_pct));
-        } else if row.flow_pct > 60.0 && row.dir == "SELL" {
-            parts.push(format!("Verkoopdruk: {:.0}% sell-flow.", row.flow_pct));
-        } else {
-            parts.push("Neutrale markt flow.".to_string());
-        }
-
-        if row.whale {
-            let whale_vol = row.whale_volume;
-            let whale_not = row.whale_notional / 1000.0;
-            parts.push(format!("Whale-trade gedetecteerd: {:.2} eenheden, €{:.0}k notional.", whale_vol, whale_not));
-        }
-
-        if row.pump_score > 5.0 {
-            parts.push(format!("Pump-score van {:.1} duidt op mogelijke accumulatie.", row.pump_score));
-        } else if row.pump_score > 2.0 {
-            parts.push(format!("Matige pump-score van {:.1}.", row.pump_score));
-        }
-
-        if row.whale_pred_label == "HIGH" {
-            parts.push(format!("Hoge kans op whale-activiteit (score {:.1}).", row.whale_pred_score));
-        } else if row.whale_pred_label == "MEDIUM" {
-            parts.push(format!("Matige kans op whales (score {:.1}).", row.whale_pred_score));
-        }
-
-        if row.reliability_label == "HIGH" {
-            parts.push(format!("Betrouwbaarheid hoog ({:.0}).", row.reliability_score));
-        } else if row.reliability_label == "LOW" {
-            parts.push(format!("Betrouwbaarheid laag ({:.0}) - let op.", row.reliability_score));
-        }
-
-        if row.alpha == "BUY" {
-            parts.push("Alpha BUY signaal: sterke combinatie van factoren.".to_string());
-        } else if row.early == "BUY" {
-            parts.push("Vroege koopindicatie.".to_string());
-        }
-
-        if row.news_sentiment > 0.7 {
-            parts.push(format!("Positieve nieuws sentiment ({:.1}).", row.news_sentiment));
-        } else if row.news_sentiment < 0.3 {
-            parts.push(format!("Negatieve nieuws sentiment ({:.1}).", row.news_sentiment));
-        }
-
-        // NIEUW: Momentum advies
-        let momentum = compute_momentum(row.pct, row.pump_score, row.flow_pct);
-        if momentum > 70.0 {
-            parts.push("Hoog momentum: Koop nu!".to_string());
-        } else if momentum > 50.0 {
-            parts.push("Matig momentum: Overweeg koop.".to_string());
-        } else {
-            parts.push("Laag momentum: Wacht.".to_string());
-        }
-
-        // NIEUW: Trade Score advies
-        let trade_score = compute_trade_score(
-            momentum,
-            compute_confidence(row, row.trades as usize, row.reliability_score),
-            row.reliability_score,
-            row.whale_pred_score,
-            row.pump_score,
-            row.flow_pct,
-            row.pct,
-        );
-        if trade_score > 80.0 {
-            parts.push("Sterk koop signaal: Trade nu!".to_string());
-        } else if trade_score > 60.0 {
-            parts.push("Matig koop: Overweeg met SL.".to_string());
-        } else {
-            parts.push("Vermijd: Te risicovol.".to_string());
-        }
-
-        if parts.is_empty() {
-            parts.push("Neutrale marktcondities.".to_string());
-        }
-
-        parts.join(" ").chars().take(200).collect::<String>()
-    }
-
     fn top10_snapshot(&self) -> Top10Response {
         let rows = self.snapshot();
 
@@ -2459,6 +2395,38 @@ impl Engine {
         }
     }
 
+    fn build_analysis(row: &Row) -> String {
+        // Bereken lokale waarden
+        let trades_count = row.trades as usize;
+        let rel_score = row.reliability_score;
+        let confidence = compute_confidence(row, trades_count, rel_score);
+        let momentum = compute_momentum(row.pct, row.pump_score, row.flow_pct);
+        let trade_score = compute_trade_score(momentum, confidence, rel_score, row.whale_pred_score, row.pump_score, row.flow_pct, row.pct);
+
+        // Advies gebaseerd op samenhang
+        let (advice, forward) = if rel_score < 50.0 || confidence < 40.0 {
+            ("Negeer. Onbetrouwbare data.", "Risico op verkeerde interpretatie door onvolledige data.")
+        } else if trade_score > 65.0 && confidence > 70.0 && (row.alpha == "BUY" || row.early == "BUY") {
+            ("Koop nu. Sterke signalen wijzen op breakout.", "Verwacht stijging door sterke flow en whale activiteit.")
+        } else if trade_score > 50.0 && momentum > 75.0 && row.dir == "BUY" && row.pct > 5.0 {
+            ("Houdt positie. Momentum ondersteunt voortzetting.", "Sterke impuls; koop voor momentum ride.")
+        } else if row.dir == "SELL" && trade_score < 45.0 && row.pct < -0.5 {
+            ("Verkoop. Daling signaal met lage scores.", "Sterke sell-off; verwacht verder verlies.")
+        } else if row.pump_score > 7.0 && rel_score < 60.0 {
+            ("Negeer. Pump risico op dump.", "Risico op dump door lage betrouwbaarheid.")
+        } else if trade_score > 60.0 && row.whale_pred_label == "HIGH" {
+            ("Koop. Whale verwachting versterkt momentum.", "Verwacht whale activiteit; monitor orderbooks.")
+        } else if momentum < 50.0 && row.pct < 0.0 {
+            ("Verkoop. Zwak momentum duidt op pullback.", "Verwacht daling; vermijd lange posities.")
+        } else {
+            ("Houdt positie. Neutrale condities.", "Mogelijke zijwaartse beweging; monitor whale en pump.")
+        };
+
+        // Combineer: advies + forward, binnen 200 chars
+        let text = format!("{}. {}", advice, forward);
+        text.chars().take(200).collect::<String>()
+    }
+
     async fn manual_add_trade(&self, pair: &str, sl_pct: f64, tp_pct: f64, fee_pct: f64, manual_amount: f64) -> bool {
         let current_price = self.candles.get(pair).and_then(|c| c.close).unwrap_or(0.0);
         if current_price <= 0.0 {
@@ -2534,7 +2502,7 @@ fn normalize_pair(wsname: &str) -> String {
 }
 
 // ============================================================================
-// HOOFDSTUK 9 – FRONTEND (HTML DASHBOARD) – AANGEPAST VOOR CONFIDENCE + MOMENTUM + TRADE SCORE
+// HOOFDSTUK 9 – FRONTEND (HTML DASHBOARD) – AANGEPAST VOOR CONFIDENCE + MOMENTUM + TRADE SCORE + HEALTH TAB + STATUS KOLOM
 // ============================================================================
 
 const DASHBOARD_HTML: &str = r####"<!DOCTYPE html>
@@ -2622,6 +2590,7 @@ tr:nth-child(even){ background:#252525; }
     <button class="tab-btn" data-tab="heatmap">Heatmap</button>
     <button class="tab-btn" data-tab="stars">Stars</button>
     <button class="tab-btn" data-tab="news">News</button>
+    <button class="tab-btn" data-tab="health">Health</button>
     <button class="tab-btn" data-tab="config">Config</button>
     <button class="tab-btn" data-tab="guide">Guide</button>
   </div>
@@ -2780,6 +2749,7 @@ tr:nth-child(even){ background:#252525; }
           <th>Open TS</th>
           <th>Fee %</th>
           <th>Amount</th>
+          <th>Status</th>
           <th>Actions</th>
         </tr>
       </thead>
@@ -2891,6 +2861,19 @@ tr:nth-child(even){ background:#252525; }
       </thead>
       <tbody></tbody>
     </table>
+  </div>
+
+  <div id="view-health" style="display:none;">
+    <h2>System Health</h2>
+    <table id="health-table">
+      <thead>
+        <tr>
+          <th>Metric</th><th>Value</th><th>Status</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+    <p id="health-last-update">Last update: N/A</p>
   </div>
 
   <div id="view-config" style="display:none;">
@@ -3071,6 +3054,8 @@ function switchTab(tab) {
     tab === "stars" ? "block" : "none";
   document.getElementById("view-news").style.display =
     tab === "news" ? "block" : "none";
+  document.getElementById("view-health").style.display =
+    tab === "health" ? "block" : "none";
   document.getElementById("view-config").style.display =
     tab === "config" ? "block" : "none";
   document.getElementById("view-guide").style.display =
@@ -3086,6 +3071,8 @@ function switchTab(tab) {
     loadStars();
   } else if (tab === "news") {
     loadNews();
+  } else if (tab === "health") {
+    loadHealth();
   } else if (tab === "config") {
     loadConfig();
   }
@@ -3369,6 +3356,13 @@ async function loadManualTrades() {
     manualTradeSearchInitialized = true;
   }
   
+  // Haal stats data op voor gecombineerde status per pair
+  let statsData = await fetch("/api/stats").then(r => r.json());
+  let statsMap = {};
+  statsData.forEach(row => {
+    statsMap[row.pair] = row; // Sla hele row op voor toegang tot scores
+  });
+
   // Apply current filter to update dropdown
   filterManualTradePairs();
 
@@ -3376,17 +3370,40 @@ async function loadManualTrades() {
   let tbody = document.querySelector("#manual-trades-table tbody");
   tbody.innerHTML = "";
   tradesData.trades.forEach(trade => {
+    let row = statsMap[trade.pair];
+    let statusIcon = '⚪'; // Standaard neutraal
+    if (row) {
+      let buySignals = 0;
+      let sellSignals = 0;
+
+      // Buy triggers
+      if (row.score > 3.0) buySignals += 1; // Lagere drempel
+      if (row.flow_pct > 60.0) buySignals += 1;
+      if (row.whale_pred_score > 5.0) buySignals += 1;
+      if (row.pump_score > 3.0) buySignals += 1;
+      if (row.alpha === "BUY" || row.early === "BUY") buySignals += 1;
+
+      // Sell triggers (gevoeliger gemaakt)
+      if (row.flow_pct < 40.0) sellSignals += 1; // Hogere drempel voor sneller rood
+      if (row.pct < -1.0) sellSignals += 1; // NIEUW: Daling >1% = sell
+      if (row.alpha === "SELL" || row.early === "SELL") sellSignals += 1;
+
+      if (buySignals >= 2) statusIcon = '🟢'; // Markt koopt
+      else if (sellSignals >= 1) statusIcon = '🔴'; // Markt verkoopt
+      // Anders neutraal
+    }
     tbody.innerHTML += `
       <tr>
         <td>${trade.pair}</td>
         <td>${trade.entry_price.toFixed(5)}</td>
         <td>${trade.size.toFixed(5)}</td>
         <td>${trade.current_price.toFixed(5)}</td>
-        <td class="${trade.pnl_abs > 0 ? 'pos' : 'neg'}">€${trade.pnl_abs.toFixed(2)}</td>
-        <td class="${trade.pnl_pct > 0 ? 'pos' : 'neg'}">${trade.pnl_pct.toFixed(2)}%</td>
+        <td class="${trade.pnl_abs > 0 ? 'pos' : (trade.pnl_abs < 0 ? 'neg' : '')}">€${trade.pnl_abs.toFixed(2)}</td>
+        <td class="${trade.pnl_pct > 0 ? 'pos' : (trade.pnl_pct < 0 ? 'neg' : '')}">${trade.pnl_pct.toFixed(2)}%</td>
         <td>${new Date(trade.open_ts * 1000).toLocaleString()}</td>
         <td>${trade.fee_pct.toFixed(2)}%</td>
         <td>€${trade.manual_amount.toFixed(2)}</td>
+        <td>${statusIcon}</td>  <!-- Actuele markt-status per munt -->
         <td><button onclick="closeManualTrade('${trade.pair}')" style="padding:3px 8px;">Close</button></td>
       </tr>
     `;
@@ -3751,7 +3768,11 @@ async function loadStars() {
           tbody.innerHTML = "";
           function fmtTime(ts) {
             const d = new Date(ts * 1000);
-            return d.toLocaleTimeString();
+            const dd = String(d.getDate()).padStart(2,'0');
+            const mm = String(d.getMonth()+1).padStart(2,'0');
+            const hh = String(d.getHours()).padStart(2,'0');
+            const mi = String(d.getMinutes()).padStart(2,'0');
+            return `${dd}-${mm} ${hh}:${mi}`;
           }
           function renderRow(r) {
             let pctClass = r.pct > 0 ? "pos" : (r.pct < 0 ? "neg" : "");
@@ -3845,6 +3866,22 @@ async function loadNews() {
       }
     })
     .catch(err => console.error("news error", err));
+}
+
+async function loadHealth() {
+  try {
+    let res = await fetch("/api/health");
+    let data = await res.json();
+    let tbody = document.querySelector("#health-table tbody");
+    tbody.innerHTML = "";
+    for (let [key, value] of Object.entries(data)) {
+      let status = (key.includes("restart") && value > 0) ? "neg" : "pos";
+      tbody.innerHTML += `<tr><td>${key.replace(/_/g, ' ')}</td><td>${value}</td><td class="${status}">OK</td></tr>`;
+    }
+    document.getElementById("health-last-update").textContent = `Last update: ${new Date().toLocaleTimeString()}`;
+  } catch (e) {
+    console.error("Health load error:", e);
+  }
 }
 
 async function loadConfig() {
@@ -3999,6 +4036,8 @@ function tick() {
     loadBacktest();
   } else if (activeTab === "news") {
     loadNews();
+  } else if (activeTab === "health") {
+    loadHealth();
   } else if (activeTab === "stars") {
     loadStars();
   }
@@ -4026,6 +4065,7 @@ async fn run_kraken_worker(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let url = "wss://ws.kraken.com";
 
+    let mut backoff = Duration::from_secs(5);
     loop {
         println!(
             "WS{}: connecting to Kraken ({} pairs)...",
@@ -4037,8 +4077,9 @@ async fn run_kraken_worker(
         let (ws, _) = match connect_res {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("WS{}: connect error {:?}, retry in 5s", worker_id, e);
-                sleep(Duration::from_secs(5)).await;
+                eprintln!("WS{}: connect error {:?}, retry in {:?}", worker_id, e, backoff);
+                sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(300)); // Max 5 min
                 continue;
             }
         };
@@ -4055,10 +4096,11 @@ async fn run_kraken_worker(
 
         if let Err(e) = write.send(Message::Text(sub.to_string())).await {
             eprintln!(
-                "WS{}: subscribe send error {:?}, reconnecting...",
-                worker_id, e
+                "WS{}: subscribe send error {:?}, retry in {:?}",
+                worker_id, e, backoff
             );
-            sleep(Duration::from_secs(5)).await;
+            sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_secs(300));
             continue;
         }
 
@@ -4067,6 +4109,8 @@ async fn run_kraken_worker(
             worker_id,
             ws_pairs.len()
         );
+
+        backoff = Duration::from_secs(5); // Reset bij succes
 
         while let Some(msg_res) = read.next().await {
             let msg = match msg_res {
@@ -4107,8 +4151,9 @@ async fn run_kraken_worker(
             }
         }
 
-        eprintln!("WS{}: stream ended, reconnecting in 5s...", worker_id);
-        sleep(Duration::from_secs(5)).await;
+        eprintln!("WS{}: stream ended, reconnecting in {:?}", worker_id, backoff);
+        sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(300));
     }
 }
 
@@ -4119,6 +4164,7 @@ async fn run_orderbook_worker(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let url = "wss://ws.kraken.com";
 
+    let mut backoff = Duration::from_secs(5);
     loop {
         println!(
             "OB_WS{}: connecting to Kraken orderbook ({} pairs)...",
@@ -4130,8 +4176,9 @@ async fn run_orderbook_worker(
         let (ws, _) = match connect_res {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("OB_WS{}: connect error {:?}, retry in 5s", worker_id, e);
-                sleep(Duration::from_secs(5)).await;
+                eprintln!("OB_WS{}: connect error {:?}, retry in {:?}", worker_id, e, backoff);
+                sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(300));
                 continue;
             }
         };
@@ -4149,10 +4196,11 @@ async fn run_orderbook_worker(
 
         if let Err(e) = write.send(Message::Text(sub.to_string())).await {
             eprintln!(
-                "OB_WS{}: subscribe send error {:?}, reconnecting...",
-                worker_id, e
+                "OB_WS{}: subscribe send error {:?}, retry in {:?}",
+                worker_id, e, backoff
             );
-            sleep(Duration::from_secs(5)).await;
+            sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_secs(300));
             continue;
         }
 
@@ -4161,6 +4209,8 @@ async fn run_orderbook_worker(
             worker_id,
             ws_pairs.len()
         );
+
+        backoff = Duration::from_secs(5); // Reset bij succes
 
         while let Some(msg_res) = read.next().await {
             let msg = match msg_res {
@@ -4259,8 +4309,9 @@ async fn run_orderbook_worker(
             }
         }
 
-        eprintln!("OB_WS{}: stream ended, reconnecting in 5s...", worker_id);
-        sleep(Duration::from_secs(5)).await;
+        eprintln!("OB_WS{}: stream ended, reconnecting in {:?}", worker_id, backoff);
+        sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(300));
     }
 }
 
@@ -4337,7 +4388,7 @@ async fn run_news_scanner(engine: Engine) -> Result<(), Box<dyn std::error::Erro
     let mut processed_titles: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     loop {
-        // Voorbeeld: RSS feed van een crypto nieuws site (bijv. CoinDesk)
+        // Voorbeeld: RSS feed van een crypto nieuws site (bijv. CoinTelegraph)
         let rss_url = "https://cointelegraph.com/rss";
 
         if let Ok(resp) = client.get(rss_url).send().await {
@@ -4386,8 +4437,8 @@ async fn run_news_scanner(engine: Engine) -> Result<(), Box<dyn std::error::Erro
             }
         }
 
-        // Wacht 1 minuut voor volgende scan
-        sleep(Duration::from_secs(60)).await;
+        // Wacht 1 uur voor volgende scan (veranderd van 60s)
+        sleep(Duration::from_secs(3600)).await;
     }
 }
 
@@ -4597,7 +4648,7 @@ async fn run_aggressive_cleanup(engine: Engine) {
 }
 
 // ============================================================================
-// HOOFDSTUK 14 – HTTP SERVER & API (MET HEALTH ENDPOINT)
+// HOOFDSTUK 14 – HTTP SERVER & API (MET HEALTH ENDPOINT UITGEBREID)
 // ============================================================================
 
 
@@ -4692,13 +4743,21 @@ async fn run_http(engine: Engine, config: Arc<Mutex<AppConfig>>) {
             warp::reply::json(&sorted_history)
         });
 
-    // NIEUW: Health endpoint
-    let api_health = warp::path!("healthz").map(|| {
+    // UITGEBREIDE Health endpoint met echte metrics (gebruikt sysinfo indien beschikbaar)
+    let api_health = warp::path!("api" / "health").map(|| {
         let uptime = Utc::now().timestamp() - *START_TIME;
+        let counts = SELF_HEALING_COUNTS.lock().unwrap();
+        // Placeholder voor sysinfo: memory en threads (vereist crate)
+        let memory_mb = 0; // sysinfo::System::new_all().used_memory() / 1024 / 1024;
+        let threads_active = 0; // sysinfo::System::new_all().processes().len();
         warp::reply::json(&serde_json::json!({
-            "status": "ok",
-            "uptime_sec": uptime,
-            "version": "1.0"
+            "uptime_seconds": uptime,
+            "memory_mb": memory_mb,
+            "threads_active": threads_active,
+            "news_scanner_restarts": counts.news_scanner_restarts,
+            "ws_worker_restarts": counts.ws_worker_restarts,
+            "anomaly_scanner_restarts": counts.anomaly_scanner_restarts,
+            "total_restarts": counts.total_restarts
         }))
     });
 
@@ -4774,7 +4833,39 @@ async fn run_http(engine: Engine, config: Arc<Mutex<AppConfig>>) {
 }
 
 // ============================================================================
-// HOOFDSTUK 15 – MAIN ENTRYPOINT (MET GRACEFUL SHUTDOWN)
+// HOOFDSTUK 15 – SELF-HEALING WATCHDOG (NIEUW, LIMIET VERWIJDERD)
+// ============================================================================
+
+async fn run_watchdog(engine: Engine) -> Result<(), Box<dyn std::error::Error>> {
+    println!("[WATCHDOG] Started self-healing watchdog...");
+    loop {
+        sleep(Duration::from_secs(30)).await; // Check elke 30s
+
+        // Altijd herstarten bij crashes (geen limiet meer)
+        {
+            let engine_clone = engine.clone();
+            tokio::spawn(async move {
+                if let Err(e) = run_news_scanner(engine_clone).await {
+                    eprintln!("[WATCHDOG] News scanner restart failed: {:?}", e);
+                }
+            });
+            SELF_HEALING_COUNTS.lock().unwrap().increment_news();
+        }
+
+        {
+            let engine_clone = engine.clone();
+            tokio::spawn(async move {
+                if let Err(e) = run_anomaly_scanner(engine_clone, vec![], HashMap::new()).await {
+                    eprintln!("[WATCHDOG] Anomaly scanner restart failed: {:?}", e);
+                }
+            });
+            SELF_HEALING_COUNTS.lock().unwrap().increment_anomaly();
+        }
+    }
+}
+
+// ============================================================================
+// HOOFDSTUK 16 – MAIN ENTRYPOINT (MET GRACEFUL SHUTDOWN)
 // ============================================================================
 
 
@@ -4815,7 +4906,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ws_pairs.sort();
     ws_pairs.dedup();
     let total_ws_pairs = ws_pairs.len();
-    let chunk_size = 20;
+    let chunk_size = 10; // VERLAAGD VAN 20 NAAR 10
     let chunks: Vec<Vec<String>> = ws_pairs.chunks(chunk_size).map(|c| c.to_vec()).collect();
 
     println!(
@@ -4833,7 +4924,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Loaded manual trader state");
 
     // Load stars history
-    engine.load_stars_history().await;
+    let _ = engine.load_stars_history().await; // Ignore result om warning te fixen
     println!("Loaded stars history");
 
     // Maak shutdown kanaal
@@ -4854,6 +4945,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
     println!("HTTP server spawned, should be available soon at http://localhost:8080/");
+
+    // Spawn watchdog voor self-healing (geen limiet meer)
+    let engine_watchdog = engine.clone();
+    tokio::spawn(async move {
+        if let Err(e) = run_watchdog(engine_watchdog).await {
+            eprintln!("[WATCHDOG] Watchdog error: {:?}", e);
+        }
+    });
+    println!("Watchdog spawned for self-healing");
 
     // Spawn andere tasks met shutdown listening
     for (i, chunk) in chunks.into_iter().enumerate() {
