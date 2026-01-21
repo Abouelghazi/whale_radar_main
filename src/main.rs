@@ -15,7 +15,7 @@
 //     6.3 Analyse & snapshots
 //  7. Betrouwbaarheid & kwaliteitsscores
 //  8. Normalisatie (assets & pairs)
-//  9. Frontend (HTML dashboard) – Aangepast voor Confidence + Momentum + Trade Score + Health Tab + Status Kolom
+//  9. Frontend (HTML dashboard) – Aangepast voor Confidence + Momentum + Trade Score + Health Tab + Status Kolom + Count Trades Kolom
 // 10. WebSocket workers
 // 11. REST anomaly scanner
 // 12. Self-evaluator (zelflerend)
@@ -27,6 +27,8 @@
 // Aangepast voor:
 // - Status kolom in Manual Trades: Markt-status per pair (buy/sell flow).
 // - Nieuws ophaal: 1x per uur (van 60s naar 3600s).
+// - Aanbeveling 4: Verleng age-penalty in rel_score naar 10 minuten.
+// - Nieuwe kolom Count Trades: Toont aantal Buy/Sell trades als "100_Buy / 30_Sell".
 // ============================================================================
 
 use chrono::Utc;
@@ -376,6 +378,9 @@ struct TradeState {
     news_sentiment: f64,
     recent_anom: bool,
     last_whale_pred_high: bool,
+    // NIEUW: Counters voor aantal trades per side
+    buy_trades: u64,
+    sell_trades: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -437,28 +442,9 @@ struct Row {
     reliability_score: f64,
     reliability_label: String,
     news_sentiment: f64,
-}
-
-#[derive(Debug, Clone)]
-struct ScoreWeights {
-    flow_w: f64,
-    price_w: f64,
-    whale_w: f64,
-    volume_w: f64,
-    anomaly_w: f64,
-    trend_w: f64,
-}
-impl Default for ScoreWeights {
-    fn default() -> Self {
-        Self {
-            flow_w: 2.2,
-            price_w: 0.7,
-            whale_w: 1.4,
-            volume_w: 1.3,
-            anomaly_w: 1.5,
-            trend_w: 1.1,
-        }
-    }
+    // NIEUW: Voor Count Trades kolom
+    buy_trades: u64,
+    sell_trades: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -768,6 +754,33 @@ struct ManualTradesResponse {
 }
 
 // ============================================================================
+// FIX: ScoreWeights definitie toegevoegd voor Engine
+// ============================================================================
+
+#[derive(Debug, Clone)]
+struct ScoreWeights {
+    flow_w: f64,
+    price_w: f64,
+    whale_w: f64,
+    volume_w: f64,
+    anomaly_w: f64,
+    trend_w: f64,
+}
+
+impl Default for ScoreWeights {
+    fn default() -> Self {
+        Self {
+            flow_w: 2.2,
+            price_w: 0.7,
+            whale_w: 1.4,
+            volume_w: 1.3,
+            anomaly_w: 1.5,
+            trend_w: 1.1,
+        }
+    }
+}
+
+// ============================================================================
 // HOOFDSTUK 6 – ENGINE (HART VAN HET SYSTEEM)
 // ============================================================================
 
@@ -891,8 +904,10 @@ impl Engine {
 
         if side == "b" {
             t.buy_volume += volume;
+            t.buy_trades += 1;  // NIEUW: Increment buy trades counter
         } else {
             t.sell_volume += volume;
+            t.sell_trades += 1;  // NIEUW: Increment sell trades counter
         }
         t.trade_count += 1;
 
@@ -1368,7 +1383,9 @@ impl Engine {
                         whale_pred_label: whale_pred_label.clone(), 
                         reliability_score: Self::compute_reliability(&t, ts_int).0, 
                         reliability_label: Self::compute_reliability(&t, ts_int).1, 
-                        news_sentiment: t.news_sentiment 
+                        news_sentiment: t.news_sentiment, 
+                        buy_trades: t.buy_trades, 
+                        sell_trades: t.sell_trades 
                     }),
                     whale_pred_score,
                     whale_pred_label: whale_pred_label.clone(),
@@ -1402,7 +1419,9 @@ impl Engine {
                         whale_pred_label: whale_pred_label.clone(), 
                         reliability_score: Self::compute_reliability(&t, ts_int).0, 
                         reliability_label: Self::compute_reliability(&t, ts_int).1, 
-                        news_sentiment: t.news_sentiment 
+                        news_sentiment: t.news_sentiment, 
+                        buy_trades: t.buy_trades, 
+                        sell_trades: t.sell_trades 
                     }, t.trade_count as usize, Self::compute_reliability(&t, ts_int).0),
                     momentum: compute_momentum(pct, pump_score, flow_pct),
                     trade_score: compute_trade_score(
@@ -1434,7 +1453,9 @@ impl Engine {
                             whale_pred_label: whale_pred_label.clone(), 
                             reliability_score: Self::compute_reliability(&t, ts_int).0, 
                             reliability_label: Self::compute_reliability(&t, ts_int).1, 
-                            news_sentiment: t.news_sentiment 
+                            news_sentiment: t.news_sentiment, 
+                            buy_trades: t.buy_trades, 
+                            sell_trades: t.sell_trades 
                         }, t.trade_count as usize, Self::compute_reliability(&t, ts_int).0),
                         Self::compute_reliability(&t, ts_int).0,
                         whale_pred_score,
@@ -1744,7 +1765,9 @@ impl Engine {
                         whale_pred_label: whale_pred_label.clone(), 
                         reliability_score, 
                         reliability_label: reliability_label.clone(), 
-                        news_sentiment: t.news_sentiment 
+                        news_sentiment: t.news_sentiment, 
+                        buy_trades: t.buy_trades, 
+                        sell_trades: t.sell_trades 
                     }),
                     whale_pred_score,
                     whale_pred_label: whale_pred_label.clone(),
@@ -1778,7 +1801,9 @@ impl Engine {
                         whale_pred_label: whale_pred_label.clone(), 
                         reliability_score, 
                         reliability_label: Self::compute_reliability(&t, ts_int).1, 
-                        news_sentiment: t.news_sentiment 
+                        news_sentiment: t.news_sentiment, 
+                        buy_trades: t.buy_trades, 
+                        sell_trades: t.sell_trades 
                     }, t.trade_count as usize, Self::compute_reliability(&t, ts_int).0),
                     momentum: compute_momentum(pct, pump_score, t.last_flow_pct),
                     trade_score: compute_trade_score(
@@ -1810,7 +1835,9 @@ impl Engine {
                             whale_pred_label: whale_pred_label.clone(), 
                             reliability_score, 
                             reliability_label: Self::compute_reliability(&t, ts_int).1, 
-                            news_sentiment: t.news_sentiment 
+                            news_sentiment: t.news_sentiment, 
+                            buy_trades: t.buy_trades, 
+                            sell_trades: t.sell_trades 
                         }, t.trade_count as usize, Self::compute_reliability(&t, ts_int).0),
                         Self::compute_reliability(&t, ts_int).0,
                         whale_pred_score,
@@ -1913,11 +1940,12 @@ impl Engine {
         };
 
         let dt = now_ts.saturating_sub(t.last_update_ts);
-        let ras = if dt > 300 {
+        // AANBEVELING 4: Verleng age-penalty van 5 minuten naar 10 minuten
+        let ras = if dt > 600 {  // 10 minuten in plaats van 300 (5 min)
             0.0
-        } else if dt > 120 {
+        } else if dt > 300 {
             5.0
-        } else if dt > 60 {
+        } else if dt > 120 {
             10.0
         } else {
             15.0
@@ -2046,6 +2074,8 @@ impl Engine {
                 reliability_score,
                 reliability_label,
                 news_sentiment: self.news_sentiment.get(&pair).map(|v| v.0).unwrap_or(0.5),
+                buy_trades: v.buy_trades,
+                sell_trades: v.sell_trades,
             });
         }
 
@@ -2240,7 +2270,7 @@ impl Engine {
                 let rel_score = r.reliability_score;
                 let confidence = compute_confidence(r, trades_count as usize, rel_score);
 
-                let signal_type = if confidence < 30.0 || rel_score < 50.0 || trades_count < 5 {
+                let signal_type = if confidence < 30.0 || rel_score < 30.0 || trades_count < 3 {
                     "UNCERTAIN".to_string()
                 } else if r.whale {
                     "WHALE".to_string()
@@ -2331,7 +2361,7 @@ impl Engine {
                 let rel_score = r.reliability_score;
                 let confidence = compute_confidence(r, trades_count as usize, rel_score);
 
-                let signal_type = if confidence < 30.0 || rel_score < 50.0 || trades_count < 5 {
+                let signal_type = if confidence < 30.0 || rel_score < 30.0 || trades_count < 3 {
                     "UNCERTAIN".to_string()
                 } else if r.whale {
                     "WHALE".to_string()
@@ -2404,7 +2434,7 @@ impl Engine {
         let trade_score = compute_trade_score(momentum, confidence, rel_score, row.whale_pred_score, row.pump_score, row.flow_pct, row.pct);
 
         // Advies gebaseerd op samenhang
-        let (advice, forward) = if rel_score < 50.0 || confidence < 40.0 {
+        let (advice, forward) = if rel_score < 30.0 || confidence < 30.0 {
             ("Negeer. Onbetrouwbare data.", "Risico op verkeerde interpretatie door onvolledige data.")
         } else if trade_score > 65.0 && confidence > 70.0 && (row.alpha == "BUY" || row.early == "BUY") {
             ("Koop nu. Sterke signalen wijzen op breakout.", "Verwacht stijging door sterke flow en whale activiteit.")
@@ -2502,7 +2532,7 @@ fn normalize_pair(wsname: &str) -> String {
 }
 
 // ============================================================================
-// HOOFDSTUK 9 – FRONTEND (HTML DASHBOARD) – AANGEPAST VOOR CONFIDENCE + MOMENTUM + TRADE SCORE + HEALTH TAB + STATUS KOLOM
+// HOOFDSTUK 9 – FRONTEND (HTML DASHBOARD) – AANGEPAST VOOR CONFIDENCE + MOMENTUM + TRADE SCORE + HEALTH TAB + STATUS KOLOM + COUNT TRADES KOLOM
 // ============================================================================
 
 const DASHBOARD_HTML: &str = r####"<!DOCTYPE html>
@@ -2663,7 +2693,7 @@ tr:nth-child(even){ background:#252525; }
         <tr>
           <th>Time</th><th>Pair</th><th>Price</th><th>%</th><th>Flow</th><th>Dir</th>
           <th>Early</th><th>Alpha</th><th>Whale</th><th>Pump</th>
-          <th>WhPred</th><th>Rel</th><th>Type</th><th>Confidence</th><th>Momentum</th><th>Trade Score</th><th>Visual</th><th>Analyse</th>
+          <th>WhPred</th><th>Rel</th><th>Type</th><th>Confidence</th><th>Momentum</th><th>Trade Score</th><th>Count Trades</th><th>Visual</th><th>Analyse</th>
         </tr>
       </thead>
       <tbody></tbody>
@@ -2675,7 +2705,7 @@ tr:nth-child(even){ background:#252525; }
         <tr>
           <th>Time</th><th>Pair</th><th>Price</th><th>%</th><th>Flow</th><th>Dir</th>
           <th>Early</th><th>Alpha</th><th>Whale</th><th>Pump</th>
-          <th>WhPred</th><th>Rel</th><th>Type</th><th>Confidence</th><th>Momentum</th><th>Trade Score</th><th>Visual</th><th>Analyse</th>
+          <th>WhPred</th><th>Rel</th><th>Type</th><th>Confidence</th><th>Momentum</th><th>Trade Score</th><th>Count Trades</th><th>Visual</th><th>Analyse</th>
         </tr>
       </thead>
       <tbody></tbody>
@@ -2687,7 +2717,7 @@ tr:nth-child(even){ background:#252525; }
         <tr>
           <th>Time</th><th>Pair</th><th>Price</th><th>%</th><th>Flow</th><th>Dir</th>
           <th>Early</th><th>Alpha</th><th>Whale</th><th>Pump</th>
-          <th>Rel</th><th>Type</th><th>Confidence</th><th>Momentum</th><th>Trade Score</th><th>Visual</th><th>Analyse</th>
+          <th>Rel</th><th>Type</th><th>Confidence</th><th>Momentum</th><th>Trade Score</th><th>Count Trades</th><th>Visual</th><th>Analyse</th>
         </tr>
       </thead>
       <tbody></tbody>
@@ -2982,6 +3012,7 @@ tr:nth-child(even){ background:#252525; }
         <li><b>Confidence</b>: gecombineerde score (0-100%) voor hoe betrouwbaar het signaal is.</li>
         <li><b>Momentum</b>: koopmoment score (0-100%) gebaseerd op %, Pump en Flow.</li>
         <li><b>Trade Score</b>: holistische beslissingscore (0-100%) voor koop/vermijd, met risico-penaliteiten.</li>
+        <li><b>Count Trades</b>: aantal Buy en Sell trades, geformatteerd als "100_Buy / 30_Sell".</li>
         <li><b>News Sent.</b>: sentiment van recente nieuwsartikelen (0-1).</li>
         <li><b>Visual</b>: link naar de bijbehorende Kraken Pro grafiek.</li>
       </ul>
@@ -3256,6 +3287,8 @@ async function loadTop10() {
 
     let typeClass = "signal_type signal_type_" + r.signal_type;
 
+    let countTradesText = `${r.buy_trades}_Buy / ${r.sell_trades}_Sell`;
+
     if (isFallers) {
       return `<tr>
         <td>${fmtTime(r.ts)}</td>
@@ -3280,6 +3313,7 @@ async function loadTop10() {
         <td>${r.confidence.toFixed(1)}%</td>
         <td>${r.momentum.toFixed(1)}%</td>
         <td>${r.trade_score.toFixed(1)}</td>
+        <td>${countTradesText}</td>
         <td>${visual}</td>
         <td>${r.analysis}</td>
       </tr>`;
@@ -3308,6 +3342,7 @@ async function loadTop10() {
         <td>${r.confidence.toFixed(1)}%</td>
         <td>${r.momentum.toFixed(1)}%</td>
         <td>${r.trade_score.toFixed(1)}</td>
+        <td>${countTradesText}</td>
         <td>${visual}</td>
         <td>${r.analysis}</td>
       </tr>`;
