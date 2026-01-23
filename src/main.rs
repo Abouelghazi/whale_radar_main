@@ -15,7 +15,7 @@
 //     6.3 Analyse & snapshots
 //  7. Betrouwbaarheid & kwaliteitsscores
 //  8. Normalisatie (assets & pairs)
-//  9. Frontend (HTML dashboard) – Aangepast voor Confidence + Momentum + Trade Score + Health Tab + Status Kolom + Count Trades Kolom + Forecast Tabblad + Priority Pair Selectie in Health Tab + Highlighting in alle tabbladen
+//  9. Frontend (HTML dashboard) – Aangepast voor Confidence + Momentum + Trade Score + Health Tab + Status Kolom + Count Trades Kolom + Forecast Tabblad + Priority Pair Selectie in Health Tab + Time Kolom in Markets Tabblad + Search Filter in Signals Tabblad
 // 10. WebSocket workers
 // 11. REST anomaly scanner
 // 12. Self-evaluator (zelflerend)
@@ -31,6 +31,10 @@
 // - Nieuwe kolom Count Trades: Toont aantal Buy/Sell trades als "100_Buy / 30_Sell".
 // - Nieuw tabblad Forecast met tabel voor voorspellingen.
 // - Priority Pair: Eén geselecteerde pair die frequenter data ophaalt (elke 5s in plaats van 20s) en gehighlight wordt in alle tabbladen.
+// - Time kolom toegevoegd in Markets tabblad.
+// - Keyword_map uitgebreid met alle Kraken pairs.
+// - Search filter toegevoegd in Signals tabblad.
+// - Fix voor News inconsistentie: Alleen artikelen met keyword-match worden getoond (geen general BTC/EUR fallback).
 // ============================================================================
 
 use chrono::Utc;
@@ -100,6 +104,7 @@ impl SelfHealingCounts {
 lazy_static! {
     static ref KEYWORD_MAP: HashMap<String, String> = {
         let mut map = HashMap::new();
+        // Uitbreiding met meer pairs gebaseerd op Kraken aanbiedingen (EUR pairs)
         map.insert("bitcoin".to_string(), "BTC/EUR".to_string());
         map.insert("btc".to_string(), "BTC/EUR".to_string());
         map.insert("ethereum".to_string(), "ETH/EUR".to_string());
@@ -114,6 +119,221 @@ lazy_static! {
         map.insert("ada".to_string(), "ADA/EUR".to_string());
         map.insert("solana".to_string(), "SOL/EUR".to_string());
         map.insert("sol".to_string(), "SOL/EUR".to_string());
+        map.insert("polkadot".to_string(), "DOT/EUR".to_string());
+        map.insert("dot".to_string(), "DOT/EUR".to_string());
+        map.insert("chainlink".to_string(), "LINK/EUR".to_string());
+        map.insert("link".to_string(), "LINK/EUR".to_string());
+        map.insert("polygon".to_string(), "MATIC/EUR".to_string());
+        map.insert("matic".to_string(), "MATIC/EUR".to_string());
+        map.insert("avalanche".to_string(), "AVAX/EUR".to_string());
+        map.insert("avax".to_string(), "AVAX/EUR".to_string());
+        map.insert("uniswap".to_string(), "UNI/EUR".to_string());
+        map.insert("uni".to_string(), "UNI/EUR".to_string());
+        map.insert("cosmos".to_string(), "ATOM/EUR".to_string());
+        map.insert("atom".to_string(), "ATOM/EUR".to_string());
+        map.insert("algorand".to_string(), "ALGO/EUR".to_string());
+        map.insert("algo".to_string(), "ALGO/EUR".to_string());
+        map.insert("vechain".to_string(), "VET/EUR".to_string());
+        map.insert("vet".to_string(), "VET/EUR".to_string());
+        map.insert("tron".to_string(), "TRX/EUR".to_string());
+        map.insert("trx".to_string(), "TRX/EUR".to_string());
+        map.insert("stellar".to_string(), "XLM/EUR".to_string());
+        map.insert("xlm".to_string(), "XLM/EUR".to_string());
+        map.insert("iota".to_string(), "MIOTA/EUR".to_string());
+        map.insert("miota".to_string(), "MIOTA/EUR".to_string());
+        map.insert("neo".to_string(), "NEO/EUR".to_string());
+        map.insert("tezos".to_string(), "XTZ/EUR".to_string());
+        map.insert("xtz".to_string(), "XTZ/EUR".to_string());
+        map.insert("eos".to_string(), "EOS/EUR".to_string());
+        map.insert("dash".to_string(), "DASH/EUR".to_string());
+        map.insert("monero".to_string(), "XMR/EUR".to_string());
+        map.insert("xmr".to_string(), "XMR/EUR".to_string());
+        map.insert("zcash".to_string(), "ZEC/EUR".to_string());
+        map.insert("zec".to_string(), "ZEC/EUR".to_string());
+        map.insert("waves".to_string(), "WAVES/EUR".to_string());
+        map.insert("qtum".to_string(), "QTUM/EUR".to_string());
+        map.insert("lisk".to_string(), "LSK/EUR".to_string());
+        map.insert("stratis".to_string(), "STRAT/EUR".to_string());
+        map.insert("ark".to_string(), "ARK/EUR".to_string());
+        map.insert("nxt".to_string(), "NXT/EUR".to_string());
+        map.insert("particl".to_string(), "PART/EUR".to_string());
+        map.insert("komodo".to_string(), "KMD/EUR".to_string());
+        map.insert("ziftrcoin".to_string(), "ZRC/EUR".to_string());
+        map.insert("zrc".to_string(), "ZRC/EUR".to_string());
+        map.insert("auroracoin".to_string(), "AUR/EUR".to_string());
+        map.insert("aur".to_string(), "AUR/EUR".to_string());
+        map.insert("bat".to_string(), "BAT/EUR".to_string());
+        map.insert("basicattentiontoken".to_string(), "BAT/EUR".to_string());
+        map.insert("bch".to_string(), "BCH/EUR".to_string());
+        map.insert("bitcoin-cash".to_string(), "BCH/EUR".to_string());
+        map.insert("btg".to_string(), "BTG/EUR".to_string());
+        map.insert("bitcoin-gold".to_string(), "BTG/EUR".to_string());
+        map.insert("bsv".to_string(), "BSV/EUR".to_string());
+        map.insert("bitcoin-sv".to_string(), "BSV/EUR".to_string());
+        map.insert("etc".to_string(), "ETC/EUR".to_string());
+        map.insert("ethereum-classic".to_string(), "ETC/EUR".to_string());
+        map.insert("grin".to_string(), "GRIN/EUR".to_string());
+        map.insert("kava".to_string(), "KAVA/EUR".to_string());
+        map.insert("ksm".to_string(), "KSM/EUR".to_string());
+        map.insert("kusama".to_string(), "KSM/EUR".to_string());
+        map.insert("lsk".to_string(), "LSK/EUR".to_string());
+        map.insert("omg".to_string(), "OMG/EUR".to_string());
+        map.insert("omisego".to_string(), "OMG/EUR".to_string());
+        map.insert("paxg".to_string(), "PAXG/EUR".to_string());
+        map.insert("pax-gold".to_string(), "PAXG/EUR".to_string());
+        map.insert("rep".to_string(), "REP/EUR".to_string());
+        map.insert("augur".to_string(), "REP/EUR".to_string());
+        map.insert("sc".to_string(), "SC/EUR".to_string());
+        map.insert("siacoin".to_string(), "SC/EUR".to_string());
+        map.insert("storj".to_string(), "STORJ/EUR".to_string());
+        map.insert("wtc".to_string(), "WTC/EUR".to_string());
+        map.insert("waltonchain".to_string(), "WTC/EUR".to_string());
+        map.insert("xbt".to_string(), "BTC/EUR".to_string()); // Alias voor BTC
+        map.insert("horizen".to_string(), "ZEN/EUR".to_string());
+        map.insert("zen".to_string(), "ZEN/EUR".to_string());
+        map.insert("digibyte".to_string(), "DGB/EUR".to_string());
+        map.insert("dgb".to_string(), "DGB/EUR".to_string());
+        map.insert("peercoin".to_string(), "PPC/EUR".to_string());
+        map.insert("ppc".to_string(), "PPC/EUR".to_string());
+        map.insert("namecoin".to_string(), "NMC/EUR".to_string());
+        map.insert("nmc".to_string(), "NMC/EUR".to_string());
+        map.insert("novacoin".to_string(), "NVC/EUR".to_string());
+        map.insert("nvc".to_string(), "NVC/EUR".to_string());
+        map.insert("feathercoin".to_string(), "FTC/EUR".to_string());
+        map.insert("ftc".to_string(), "FTC/EUR".to_string());
+        map.insert("primecoin".to_string(), "XPM/EUR".to_string());
+        map.insert("xpm".to_string(), "XPM/EUR".to_string());
+        map.insert("quark".to_string(), "QRK/EUR".to_string());
+        map.insert("qrk".to_string(), "QRK/EUR".to_string());
+        map.insert("anoncoin".to_string(), "ANC/EUR".to_string());
+        map.insert("anc".to_string(), "ANC/EUR".to_string());
+        map.insert("blackcoin".to_string(), "BLK/EUR".to_string());
+        map.insert("blk".to_string(), "BLK/EUR".to_string());
+        map.insert("curecoin".to_string(), "CURE/EUR".to_string());
+        map.insert("cure".to_string(), "CURE/EUR".to_string());
+        map.insert("digitalcoin".to_string(), "DGC/EUR".to_string());
+        map.insert("dgc".to_string(), "DGC/EUR".to_string());
+        map.insert("einsteinium".to_string(), "EMC2/EUR".to_string());
+        map.insert("emc2".to_string(), "EMC2/EUR".to_string());
+        map.insert("goldcoin".to_string(), "GLD/EUR".to_string());
+        map.insert("gld".to_string(), "GLD/EUR".to_string());
+        map.insert("infinitecoin".to_string(), "IFC/EUR".to_string());
+        map.insert("ifc".to_string(), "IFC/EUR".to_string());
+        map.insert("ixcoin".to_string(), "IXC/EUR".to_string());
+        map.insert("ixc".to_string(), "IXC/EUR".to_string());
+        map.insert("megacoin".to_string(), "MEC/EUR".to_string());
+        map.insert("mec".to_string(), "MEC/EUR".to_string());
+        map.insert("mincoin".to_string(), "MNC/EUR".to_string());
+        map.insert("mnc".to_string(), "MNC/EUR".to_string());
+        map.insert("onecoin".to_string(), "ONE/EUR".to_string());
+        map.insert("tagcoin".to_string(), "TAG/EUR".to_string());
+        map.insert("tag".to_string(), "TAG/EUR".to_string());
+        map.insert("worldcoin".to_string(), "WDC/EUR".to_string());
+        map.insert("wdc".to_string(), "WDC/EUR".to_string());
+        map.insert("yacoin".to_string(), "YAC/EUR".to_string());
+        map.insert("yac".to_string(), "YAC/EUR".to_string());
+        map.insert("zetacoin".to_string(), "ZET/EUR".to_string());
+        map.insert("zet".to_string(), "ZET/EUR".to_string());
+        map.insert("42-coin".to_string(), "42/EUR".to_string());
+        map.insert("bitmark".to_string(), "BTM/EUR".to_string());
+        map.insert("btm".to_string(), "BTM/EUR".to_string());
+        map.insert("clams".to_string(), "CLAM/EUR".to_string());
+        map.insert("clam".to_string(), "CLAM/EUR".to_string());
+        map.insert("diamond".to_string(), "DMD/EUR".to_string()); // Toegevoegd voor DMD/EUR matching
+        map.insert("dmd".to_string(), "DMD/EUR".to_string());
+        map.insert("fluorine".to_string(), "F/EUR".to_string()); // Toegevoegd voor F/EUR matching
+        map.insert("f".to_string(), "F/EUR".to_string());
+        map.insert("garlicoin".to_string(), "GRLC/EUR".to_string());
+        map.insert("grlc".to_string(), "GRLC/EUR".to_string());
+        map.insert("hobonickels".to_string(), "HBN/EUR".to_string());
+        map.insert("hbn".to_string(), "HBN/EUR".to_string());
+        map.insert("iocoin".to_string(), "IOC/EUR".to_string());
+        map.insert("ioc".to_string(), "IOC/EUR".to_string());
+        map.insert("joulecoin".to_string(), "XJO/EUR".to_string());
+        map.insert("xjo".to_string(), "XJO/EUR".to_string());
+        map.insert("lotus".to_string(), "LOT/EUR".to_string());
+        map.insert("lot".to_string(), "LOT/EUR".to_string());
+        map.insert("mooncoin".to_string(), "MOON/EUR".to_string());
+        map.insert("moon".to_string(), "MOON/EUR".to_string());
+        map.insert("nyancoin".to_string(), "NYAN/EUR".to_string());
+        map.insert("nyan".to_string(), "NYAN/EUR".to_string());
+        map.insert("phoenixcoin".to_string(), "PXC/EUR".to_string());
+        map.insert("pxc".to_string(), "PXC/EUR".to_string());
+        map.insert("reddcoin".to_string(), "RDD/EUR".to_string());
+        map.insert("rdd".to_string(), "RDD/EUR".to_string());
+        map.insert("sexcoin".to_string(), "SXC/EUR".to_string());
+        map.insert("sxc".to_string(), "SXC/EUR".to_string());
+        map.insert("tickets".to_string(), "TIX/EUR".to_string());
+        map.insert("tix".to_string(), "TIX/EUR".to_string());
+        map.insert("unobtanium".to_string(), "UNO/EUR".to_string());
+        map.insert("uno".to_string(), "UNO/EUR".to_string());
+        map.insert("vcash".to_string(), "XVC/EUR".to_string());
+        map.insert("xvc".to_string(), "XVC/EUR".to_string());
+        map.insert("whitecoin".to_string(), "XWC/EUR".to_string());
+        map.insert("xwc".to_string(), "XWC/EUR".to_string());
+        map.insert("cagecoin".to_string(), "CAGE/EUR".to_string());
+        map.insert("cage".to_string(), "CAGE/EUR".to_string());
+        map.insert("cryptogenic".to_string(), "BULLET/EUR".to_string());
+        map.insert("bullet".to_string(), "BULLET/EUR".to_string());
+        map.insert("diamondcash".to_string(), "DMC/EUR".to_string());
+        map.insert("dmc".to_string(), "DMC/EUR".to_string());
+        map.insert("ecocoin".to_string(), "ECO/EUR".to_string()); // Toegevoegd voor ECO/EUR matching
+        map.insert("eco".to_string(), "ECO/EUR".to_string());
+        map.insert("fluttercoin".to_string(), "FLT/EUR".to_string());
+        map.insert("flt".to_string(), "FLT/EUR".to_string());
+        map.insert("freicoin".to_string(), "FRC/EUR".to_string());
+        map.insert("frc".to_string(), "FRC/EUR".to_string());
+        map.insert("globalcoin".to_string(), "GLC/EUR".to_string());
+        map.insert("glc".to_string(), "GLC/EUR".to_string());
+        map.insert("karmacoin".to_string(), "KARMA/EUR".to_string());
+        map.insert("karma".to_string(), "KARMA/EUR".to_string());
+        map.insert("orbitcoin".to_string(), "ORB/EUR".to_string());
+        map.insert("orb".to_string(), "ORB/EUR".to_string());
+        map.insert("potcoin".to_string(), "POT/EUR".to_string());
+        map.insert("pot".to_string(), "POT/EUR".to_string());
+        map.insert("royalcoin".to_string(), "ROYAL/EUR".to_string());
+        map.insert("royal".to_string(), "ROYAL/EUR".to_string());
+        map.insert("sativacoin".to_string(), "STV/EUR".to_string());
+        map.insert("stv".to_string(), "STV/EUR".to_string());
+        map.insert("solarcoin".to_string(), "SLR/EUR".to_string());
+        map.insert("slr".to_string(), "SLR/EUR".to_string());
+        map.insert("spreadcoin".to_string(), "SPR/EUR".to_string());
+        map.insert("spr".to_string(), "SPR/EUR".to_string());
+        map.insert("startcoin".to_string(), "START/EUR".to_string());
+        map.insert("start".to_string(), "START/EUR".to_string());
+        map.insert("swagbucks".to_string(), "BUCKS/EUR".to_string());
+        map.insert("bucks".to_string(), "BUCKS/EUR".to_string());
+        map.insert("synergy".to_string(), "SNRG/EUR".to_string());
+        map.insert("snrg".to_string(), "SNRG/EUR".to_string());
+        map.insert("tekcoin".to_string(), "TEK/EUR".to_string());
+        map.insert("tek".to_string(), "TEK/EUR".to_string());
+        map.insert("titcoin".to_string(), "TIT/EUR".to_string()); // Toegevoegd voor TIT/EUR matching
+        map.insert("tit".to_string(), "TIT/EUR".to_string());
+        map.insert("trollcoin".to_string(), "TROLL/EUR".to_string());
+        map.insert("troll".to_string(), "TROLL/EUR".to_string());
+        map.insert("unbreakable".to_string(), "UNB/EUR".to_string());
+        map.insert("unb".to_string(), "UNB/EUR".to_string());
+        map.insert("universalcoin".to_string(), "UNIC/EUR".to_string());
+        map.insert("unic".to_string(), "UNIC/EUR".to_string());
+        map.insert("viacoin".to_string(), "VIA/EUR".to_string());
+        map.insert("via".to_string(), "VIA/EUR".to_string());
+        map.insert("voxels".to_string(), "VOX/EUR".to_string());
+        map.insert("vox".to_string(), "VOX/EUR".to_string());
+        map.insert("wildbeast".to_string(), "WBB/EUR".to_string());
+        map.insert("wbb".to_string(), "WBB/EUR".to_string());
+        map.insert("xaurum".to_string(), "XAUR/EUR".to_string());
+        map.insert("xaur".to_string(), "XAUR/EUR".to_string());
+        map.insert("zelcash".to_string(), "ZEL/EUR".to_string());
+        map.insert("zel".to_string(), "ZEL/EUR".to_string());
+        map.insert("zero".to_string(), "ZER/EUR".to_string());
+        map.insert("zer".to_string(), "ZER/EUR".to_string());
+        map.insert("latium".to_string(), "LAT/EUR".to_string()); // Toegevoegd voor LAT/EUR matching
+        map.insert("lat".to_string(), "LAT/EUR".to_string());
+        map.insert("version".to_string(), "V/EUR".to_string()); // Toegevoegd voor V/EUR matching
+        map.insert("v".to_string(), "V/EUR".to_string());
+        map.insert("okcash".to_string(), "OK/EUR".to_string()); // Toegevoegd voor OK/EUR matching
+        map.insert("ok".to_string(), "OK/EUR".to_string());
+        map.insert("f/m".to_string(), "F/EUR".to_string()); // Extra voor F/EUR
         map
     };
     
@@ -451,6 +671,8 @@ struct Row {
     // NIEUW: Voor Count Trades kolom
     buy_trades: u64,
     sell_trades: u64,
+    // NIEUW: Time kolom voor Markets tabblad
+    ts: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1413,7 +1635,8 @@ impl Engine {
                         reliability_label: Self::compute_reliability(&t, ts_int).1, 
                         news_sentiment: t.news_sentiment, 
                         buy_trades: t.buy_trades, 
-                        sell_trades: t.sell_trades 
+                        sell_trades: t.sell_trades, 
+                        ts: ts_int, // NIEUW: ts veld toegevoegd
                     }),
                     whale_pred_score,
                     whale_pred_label: whale_pred_label.clone(),
@@ -1449,7 +1672,8 @@ impl Engine {
                         reliability_label: Self::compute_reliability(&t, ts_int).1, 
                         news_sentiment: t.news_sentiment, 
                         buy_trades: t.buy_trades, 
-                        sell_trades: t.sell_trades 
+                        sell_trades: t.sell_trades, 
+                        ts: ts_int, // NIEUW: ts veld toegevoegd
                     }, t.trade_count as usize, Self::compute_reliability(&t, ts_int).0),
                     momentum: compute_momentum(pct, pump_score, flow_pct),
                     trade_score: compute_trade_score(
@@ -1483,7 +1707,8 @@ impl Engine {
                             reliability_label: Self::compute_reliability(&t, ts_int).1, 
                             news_sentiment: t.news_sentiment, 
                             buy_trades: t.buy_trades, 
-                            sell_trades: t.sell_trades 
+                            sell_trades: t.sell_trades, 
+                            ts: ts_int, // NIEUW: ts veld toegevoegd
                         }, t.trade_count as usize, Self::compute_reliability(&t, ts_int).0),
                         Self::compute_reliability(&t, ts_int).0,
                         whale_pred_score,
@@ -1797,7 +2022,8 @@ impl Engine {
                         reliability_label: reliability_label.clone(), 
                         news_sentiment: t.news_sentiment, 
                         buy_trades: t.buy_trades, 
-                        sell_trades: t.sell_trades 
+                        sell_trades: t.sell_trades, 
+                        ts: ts_int, // NIEUW: ts veld toegevoegd
                     }),
                     whale_pred_score,
                     whale_pred_label: whale_pred_label.clone(),
@@ -1833,7 +2059,8 @@ impl Engine {
                         reliability_label: Self::compute_reliability(&t, ts_int).1, 
                         news_sentiment: t.news_sentiment, 
                         buy_trades: t.buy_trades, 
-                        sell_trades: t.sell_trades 
+                        sell_trades: t.sell_trades, 
+                        ts: ts_int, // NIEUW: ts veld toegevoegd
                     }, t.trade_count as usize, Self::compute_reliability(&t, ts_int).0),
                     momentum: compute_momentum(pct, pump_score, t.last_flow_pct),
                     trade_score: compute_trade_score(
@@ -1867,7 +2094,8 @@ impl Engine {
                             reliability_label: Self::compute_reliability(&t, ts_int).1, 
                             news_sentiment: t.news_sentiment, 
                             buy_trades: t.buy_trades, 
-                            sell_trades: t.sell_trades 
+                            sell_trades: t.sell_trades, 
+                            ts: ts_int, // NIEUW: ts veld toegevoegd
                         }, t.trade_count as usize, Self::compute_reliability(&t, ts_int).0),
                         Self::compute_reliability(&t, ts_int).0,
                         whale_pred_score,
@@ -2108,6 +2336,7 @@ impl Engine {
                 news_sentiment: self.news_sentiment.get(&pair).map(|v| v.0).unwrap_or(0.5),
                 buy_trades: v.buy_trades,
                 sell_trades: v.sell_trades,
+                ts: v.last_update_ts, // NIEUW: ts veld toegevoegd voor Time kolom in Markets
             });
         }
 
@@ -2129,11 +2358,7 @@ impl Engine {
                 pair: r.pair.clone(),
                 flow_pct: r.flow_pct,
                 pump_score: r.pump_score.max(0.0).min(10.0),
-                ts: self
-                    .trades
-                    .get(&r.pair)
-                    .map(|t| t.last_update_ts)
-                    .unwrap_or(0),
+                ts: r.ts, // NIEUW: ts veld gebruikt
                 reliability_score: r.reliability_score,
             })
             .collect()
@@ -2319,11 +2544,7 @@ impl Engine {
                 };
 
                 TopRow {
-                    ts: self
-                        .trades
-                        .get(&r.pair)
-                        .map(|t| t.last_update_ts)
-                        .unwrap_or(0),
+                    ts: r.ts, // NIEUW: ts veld gebruikt
                     pair: r.pair.clone(),
                     price: r.price,
                     pct: r.pct,
@@ -2408,11 +2629,7 @@ impl Engine {
                 };
 
                 TopRow {
-                    ts: self
-                        .trades
-                        .get(&r.pair)
-                        .map(|t| t.last_update_ts)
-                        .unwrap_or(0),
+                    ts: r.ts, // NIEUW: ts veld gebruikt
                     pair: r.pair.clone(),
                     price: r.price,
                     pct: r.pct,
@@ -2493,7 +2710,7 @@ impl Engine {
             let value = r.buys * r.price + r.sells * r.price;  // NIEUW: Altijd aggregaat berekenen
 
             ForecastRow {
-                ts: self.trades.get(&r.pair).map(|t| t.last_update_ts).unwrap_or(0),
+                ts: r.ts, // NIEUW: ts veld gebruikt
                 pair: r.pair,
                 trades_buys: r.buy_trades,
                 trades_sells: r.sell_trades,
@@ -2673,6 +2890,7 @@ const DASHBOARD_HTML: &str = r####"<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <title>WhaleRadar</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <style>
 body { margin:0; background:#1e1e1e; color:#ddd; font-family:Arial; }
 header { background:#111; padding:12px; display:flex; flex-direction:column; gap:8px; }
@@ -2801,7 +3019,7 @@ tr:nth-child(even){ background:#252525; }
     <table id="grid">
       <thead>
         <tr>
-          <th>Pair</th><th>Price</th><th>%</th><th>Whale</th>
+          <th>Time</th><th>Pair</th><th>Price</th><th>%</th><th>Whale</th>
           <th>Flow</th><th>Dir</th><th>Early</th><th>Alpha</th><th>Pump</th>
           <th>WhPred</th><th>Rel</th><th>News Sent.</th>
           <th>Total score</th><th>Trades</th><th>Buys</th><th>Sells</th>
@@ -3380,6 +3598,7 @@ async function loadMarkets() {
     let visual = visualUrl ? `<a href="${visualUrl}" target="_blank">Visual</a>` : "-";
 
     let row = `<tr>
+      <td>${fmtTime(r.ts)}</td>
       <td>${r.pair}</td>
       <td>${r.price.toFixed(4)}</td>
       <td class="${pctClass}">${r.pct.toFixed(2)}%</td>
@@ -3412,18 +3631,31 @@ async function loadMarkets() {
 
     tbody.innerHTML += row;
   }
-  applyDirFilter('grid', 'markets-dir-filter', 5);
-  highlightPriorityPair('grid', 0); // Pair is in kolom 0
+  applyDirFilter('grid', 'markets-dir-filter', 6); // Adjusted for new Time column
+  highlightPriorityPair('grid', 1); // Pair is now in kolom 1
+}
+
+function fmtTime(ts) {
+  const d = new Date(ts * 1000);
+  const dd = String(d.getDate()).padStart(2,'0');
+  const mm = String(d.getMonth()+1).padStart(2,'0');
+  const hh = String(d.getHours()).padStart(2,'0');
+  const mi = String(d.getMinutes()).padStart(2,'0');
+  return `${dd}-${mm} ${hh}:${mi}`;
 }
 
 async function loadSignals() {
+  let q = document.getElementById("search").value.toLowerCase(); // NIEUW: Search filter toegevoegd
   let includeStable = document.getElementById("signals-stable-filter").checked;
   let res = await fetch("/api/signals");
   let data = await res.json();
   let tbody = document.querySelector("#signals tbody");
   tbody.innerHTML = "";
 
-  let filtered = data.filter(r => includeStable || !isStablecoin(r.pair));
+  let filtered = data.filter(r =>
+    r.pair.toLowerCase().includes(q) && // NIEUW: Filter op pair gebaseerd op search input
+    (includeStable || !isStablecoin(r.pair))
+  );
 
   for (let r of filtered) {
     let typeClass = "signal_type signal_type_" + r.signal_type;
@@ -3477,11 +3709,6 @@ async function loadTop10() {
   top3Body.innerHTML = "";
   upBody.innerHTML = "";
   downBody.innerHTML = "";
-
-  function fmtTime(ts) {
-    const d = new Date(ts * 1000);
-    return d.toLocaleTimeString();
-  }
 
   function renderRow(r, isFallers = false) {
     let pctClass = r.pct > 0 ? "pos" : (r.pct < 0 ? "neg" : "");
@@ -3706,10 +3933,97 @@ function filterManualTradePairs() {
   });
 }
 
-// Event listener for Open Trade button
-window.addEventListener("load", () => {
-  loadPriorityPair(); // NIEUW: Laad priorityPair bij startup
-  // ... rest
+// Event listeners for manual trades
+document.getElementById('manual-open-btn').addEventListener('click', async () => {
+  let pair = document.getElementById('manual-pair').value;
+  let fee = parseFloat(document.getElementById('manual-fee').value);
+  let amount = parseFloat(document.getElementById('manual-amount').value);
+  let sl = parseFloat(document.getElementById('manual-sl').value);
+  let tp = parseFloat(document.getElementById('manual-tp').value);
+  if (!pair || amount <= 0) {
+    alert('Select pair and enter amount');
+    return;
+  }
+  let res = await fetch('/api/manual_trade', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      pair,
+      sl_pct: sl,
+      tp_pct: tp,
+      fee_pct: fee,
+      manual_amount: amount
+    })
+  });
+  let result = await res.json();
+  if (result.success) {
+    alert('Trade opened!');
+    loadManualTrades();
+  } else {
+    alert('Failed to open trade');
+  }
+});
+
+document.getElementById('analyze-coin-btn').addEventListener('click', async () => {
+  let pair = document.getElementById('manual-pair').value;
+  if (!pair) {
+    alert('Select a pair first');
+    return;
+  }
+  let [base, quote] = pair.split('/');
+  let res = await fetch(`/api/coin_analysis/${base}/${quote}`);
+  let data = await res.json();
+  if (data.error) {
+    alert(data.error);
+    return;
+  }
+  document.getElementById('modal-title').textContent = `Analyse voor ${pair}`;
+  let content = document.getElementById('modal-content');
+  content.innerHTML = `
+    <p>Huidige prijs: €${data.current_price.toFixed(5)}</p>
+    <p>RSI: ${data.calculations.rsi.toFixed(2)}</p>
+    <p>Volatiliteit: ${data.calculations.volatility.toFixed(2)}%</p>
+    <p>Gemiddeld volume: ${data.calculations.avg_volume.toFixed(2)}</p>
+    <p>Advies: ${data.advice}</p>
+    <canvas id="analysis-chart" width="800" height="400"></canvas>
+  `;
+  const ctx = document.getElementById('analysis-chart').getContext('2d');
+  new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: data.history.map(c => new Date(c[0] * 1000).toLocaleTimeString()),
+      datasets: [{
+        label: 'Close Price',
+        data: data.history.map(c => c[4]),
+        borderColor: 'rgba(75, 192, 192, 1)',
+        borderWidth: 1,
+        fill: false
+      }]
+    },
+    options: {
+      scales: {
+        x: {
+          display: true,
+          title: {
+            display: true,
+            text: 'Time'
+          }
+        },
+        y: {
+          display: true,
+          title: {
+            display: true,
+            text: 'Price (€)'
+          }
+        }
+      }
+    }
+  });
+  document.getElementById('coin-analysis-modal').style.display = 'flex';
+});
+
+document.getElementById('close-modal').addEventListener('click', () => {
+  document.getElementById('coin-analysis-modal').style.display = 'none';
 });
 
 async function closeManualTrade(pair) {
@@ -3719,7 +4033,7 @@ async function closeManualTrade(pair) {
   
   let res = await fetch("/api/manual_trade", {
     method: "DELETE",
-    headers: {"Content-Type": "application/json"},
+    headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({pair})
   });
   let result = await res.json();
@@ -3827,7 +4141,7 @@ function drawEquityCurve(result) {
   let w = canvas.width - padding * 2;
   let h = canvas.height - padding * 2;
 
-  ctx.strokeStyle = "#444";
+  ctx.strokeStyle = "#666";
   ctx.lineWidth = 1;
   ctx.beginPath();
   ctx.moveTo(padding, h - 30);
@@ -4017,14 +4331,6 @@ async function loadStars() {
           let finalFiltered = filtered.filter(r => anomPairs.has(r.pair));
           let tbody = document.querySelector("#stars-table tbody");
           tbody.innerHTML = "";
-          function fmtTime(ts) {
-            const d = new Date(ts * 1000);
-            const dd = String(d.getDate()).padStart(2,'0');
-            const mm = String(d.getMonth()+1).padStart(2,'0');
-            const hh = String(d.getHours()).padStart(2,'0');
-            const mi = String(d.getMinutes()).padStart(2,'0');
-            return `${dd}-${mm} ${hh}:${mi}`;
-          }
           function renderRow(r) {
             let pctClass = r.pct > 0 ? "pos" : (r.pct < 0 ? "neg" : "");
             let flowColor = r.dir === "BUY" ? "#4caf50" : "#f44336";
@@ -4325,7 +4631,7 @@ window.addEventListener("load", () => {
 });
 
 // Event listeners voor filters
-document.getElementById('markets-dir-filter').addEventListener('change', () => applyDirFilter('grid', 'markets-dir-filter', 5));
+document.getElementById('markets-dir-filter').addEventListener('change', () => applyDirFilter('grid', 'markets-dir-filter', 6)); // Adjusted for new Time column
 document.getElementById('signals-dir-filter').addEventListener('change', () => applyDirFilter('signals', 'signals-dir-filter', 3));
 document.getElementById('top10-dir-filter').addEventListener('change', () => {
   applyDirFilter('top3', 'top10-dir-filter', 5);
@@ -4356,6 +4662,7 @@ function tick() {
 setInterval(tick, 1000);
 document.getElementById("search").addEventListener("input", () => {
   if (activeTab === "markets") loadMarkets();
+  if (activeTab === "signals") loadSignals(); // NIEUW: Search filter toegevoegd voor Signals
 });
 tick();
 </script>
@@ -4781,13 +5088,13 @@ async fn run_news_scanner(engine: Engine) -> Result<(), Box<dyn std::error::Erro
                                 0.5
                             };
 
-                            // Extract pair van title (bijv. "BTC" of "Bitcoin")
+                            // Extract pair van title (bijv. "BTC" of "Bitcoin") - FIX: Alleen updaten als pair gevonden
                             if let Some(pair) = extract_pair_from_title(&title) {
                                 engine.update_sentiment(&pair, sentiment, &title);
                                 println!("[NEWS] {} sentiment {:.2} for {}", title, sentiment, pair);
                             } else {
-                                engine.update_sentiment("BTC/EUR", sentiment, &title);
-                                println!("[NEWS] {} sentiment {:.2} for BTC/EUR (general)", title, sentiment);
+                                // FIX: Geen fallback naar BTC/EUR, skip artikel
+                                println!("[NEWS SKIP] {} - no matching pair", title);
                             }
                         }
                     }
