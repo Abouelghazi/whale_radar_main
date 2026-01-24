@@ -15,7 +15,7 @@
 //     6.3 Analyse & snapshots
 //  7. Betrouwbaarheid & kwaliteitsscores
 //  8. Normalisatie (assets & pairs)
-//  9. Frontend (HTML dashboard) – Aangepast voor Confidence + Momentum + Trade Score + Health Tab + Status Kolom + Count Trades Kolom + Forecast Tabblad + Priority Pair Selectie in Health Tab + Tim[...]
+//  9. Frontend (HTML dashboard) – Aangepast voor Confidence + Momentum + Trade Score + Health Tab + Status Kolom + Count Trades Kolom + Forecast Tabblad + Priority Pair Selectie in Health Tab + Time Kolom in Markets Tabblad + Search Filter in Signals Tabblad
 // 10. WebSocket workers
 // 11. REST anomaly scanner
 // 12. Self-evaluator (zelflerend)
@@ -26,11 +26,13 @@
 //
 // Aangepast voor:
 // - Status kolom in Manual Trades: Markt-status per pair (buy/sell flow).
+// - Nieuws ophaal: 1x per uur (van 60s naar 3600s).
 // - Aanbeveling 4: Verleng age-penalty in rel_score naar 10 minuten.
 // - Nieuwe kolom Count Trades: Toont aantal Buy/Sell trades als "100_Buy / 30_Sell".
 // - Nieuw tabblad Forecast met tabel voor voorspellingen.
 // - Priority Pair: Eén geselecteerde pair die frequenter data ophaalt (elke 5s in plaats van 20s) en gehighlight wordt in alle tabbladen.
 // - Time kolom toegevoegd in Markets tabblad.
+// - Keyword_map uitgebreid met alle Kraken pairs.
 // - Search filter toegevoegd in Signals tabblad.
 // - Fix voor News inconsistentie: Alleen artikelen met keyword-match worden getoond (geen general BTC/EUR fallback).
 // ============================================================================
@@ -40,9 +42,11 @@ use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
 use lazy_static::lazy_static;
 use reqwest;
+use rss::Channel;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::io::Cursor;
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
@@ -61,6 +65,7 @@ lazy_static! {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SelfHealingCounts {
+    news_scanner_restarts: usize,
     ws_worker_restarts: usize,
     anomaly_scanner_restarts: usize,
     total_restarts: usize,
@@ -69,10 +74,16 @@ struct SelfHealingCounts {
 impl SelfHealingCounts {
     fn new() -> Self {
         Self {
+            news_scanner_restarts: 0,
             ws_worker_restarts: 0,
             anomaly_scanner_restarts: 0,
             total_restarts: 0,
         }
+    }
+
+    fn increment_news(&mut self) {
+        self.news_scanner_restarts += 1;
+        self.total_restarts += 1;
     }
 
     fn increment_ws(&mut self) {
@@ -89,6 +100,290 @@ impl SelfHealingCounts {
 // ============================================================================
 // LAZY STATIC INITIALIZATION
 // ============================================================================
+
+lazy_static! {
+    static ref KEYWORD_MAP: HashMap<String, String> = {
+        let mut map = HashMap::new();
+        // Uitbreiding met meer pairs gebaseerd op Kraken aanbiedingen (EUR pairs)
+        map.insert("bitcoin".to_string(), "BTC/EUR".to_string());
+        map.insert("btc".to_string(), "BTC/EUR".to_string());
+        map.insert("ethereum".to_string(), "ETH/EUR".to_string());
+        map.insert("eth".to_string(), "ETH/EUR".to_string());
+        map.insert("xrp".to_string(), "XRP/EUR".to_string());
+        map.insert("ripple".to_string(), "XRP/EUR".to_string());
+        map.insert("doge".to_string(), "DOGE/EUR".to_string());
+        map.insert("dogecoin".to_string(), "DOGE/EUR".to_string());
+        map.insert("litecoin".to_string(), "LTC/EUR".to_string());
+        map.insert("ltc".to_string(), "LTC/EUR".to_string());
+        map.insert("cardano".to_string(), "ADA/EUR".to_string());
+        map.insert("ada".to_string(), "ADA/EUR".to_string());
+        map.insert("solana".to_string(), "SOL/EUR".to_string());
+        map.insert("sol".to_string(), "SOL/EUR".to_string());
+        map.insert("polkadot".to_string(), "DOT/EUR".to_string());
+        map.insert("dot".to_string(), "DOT/EUR".to_string());
+        map.insert("chainlink".to_string(), "LINK/EUR".to_string());
+        map.insert("link".to_string(), "LINK/EUR".to_string());
+        map.insert("polygon".to_string(), "MATIC/EUR".to_string());
+        map.insert("matic".to_string(), "MATIC/EUR".to_string());
+        map.insert("avalanche".to_string(), "AVAX/EUR".to_string());
+        map.insert("avax".to_string(), "AVAX/EUR".to_string());
+        map.insert("uniswap".to_string(), "UNI/EUR".to_string());
+        map.insert("uni".to_string(), "UNI/EUR".to_string());
+        map.insert("cosmos".to_string(), "ATOM/EUR".to_string());
+        map.insert("atom".to_string(), "ATOM/EUR".to_string());
+        map.insert("algorand".to_string(), "ALGO/EUR".to_string());
+        map.insert("algo".to_string(), "ALGO/EUR".to_string());
+        map.insert("vechain".to_string(), "VET/EUR".to_string());
+        map.insert("vet".to_string(), "VET/EUR".to_string());
+        map.insert("tron".to_string(), "TRX/EUR".to_string());
+        map.insert("trx".to_string(), "TRX/EUR".to_string());
+        map.insert("stellar".to_string(), "XLM/EUR".to_string());
+        map.insert("xlm".to_string(), "XLM/EUR".to_string());
+        map.insert("iota".to_string(), "MIOTA/EUR".to_string());
+        map.insert("miota".to_string(), "MIOTA/EUR".to_string());
+        map.insert("neo".to_string(), "NEO/EUR".to_string());
+        map.insert("tezos".to_string(), "XTZ/EUR".to_string());
+        map.insert("xtz".to_string(), "XTZ/EUR".to_string());
+        map.insert("eos".to_string(), "EOS/EUR".to_string());
+        map.insert("dash".to_string(), "DASH/EUR".to_string());
+        map.insert("monero".to_string(), "XMR/EUR".to_string());
+        map.insert("xmr".to_string(), "XMR/EUR".to_string());
+        map.insert("zcash".to_string(), "ZEC/EUR".to_string());
+        map.insert("zec".to_string(), "ZEC/EUR".to_string());
+        map.insert("waves".to_string(), "WAVES/EUR".to_string());
+        map.insert("qtum".to_string(), "QTUM/EUR".to_string());
+        map.insert("lisk".to_string(), "LSK/EUR".to_string());
+        map.insert("stratis".to_string(), "STRAT/EUR".to_string());
+        map.insert("ark".to_string(), "ARK/EUR".to_string());
+        map.insert("nxt".to_string(), "NXT/EUR".to_string());
+        map.insert("particl".to_string(), "PART/EUR".to_string());
+        map.insert("komodo".to_string(), "KMD/EUR".to_string());
+        map.insert("ziftrcoin".to_string(), "ZRC/EUR".to_string());
+        map.insert("zrc".to_string(), "ZRC/EUR".to_string());
+        map.insert("auroracoin".to_string(), "AUR/EUR".to_string());
+        map.insert("aur".to_string(), "AUR/EUR".to_string());
+        map.insert("bat".to_string(), "BAT/EUR".to_string());
+        map.insert("basicattentiontoken".to_string(), "BAT/EUR".to_string());
+        map.insert("bch".to_string(), "BCH/EUR".to_string());
+        map.insert("bitcoin-cash".to_string(), "BCH/EUR".to_string());
+        map.insert("btg".to_string(), "BTG/EUR".to_string());
+        map.insert("bitcoin-gold".to_string(), "BTG/EUR".to_string());
+        map.insert("bsv".to_string(), "BSV/EUR".to_string());
+        map.insert("bitcoin-sv".to_string(), "BSV/EUR".to_string());
+        map.insert("etc".to_string(), "ETC/EUR".to_string());
+        map.insert("ethereum-classic".to_string(), "ETC/EUR".to_string());
+        map.insert("grin".to_string(), "GRIN/EUR".to_string());
+        map.insert("kava".to_string(), "KAVA/EUR".to_string());
+        map.insert("ksm".to_string(), "KSM/EUR".to_string());
+        map.insert("kusama".to_string(), "KSM/EUR".to_string());
+        map.insert("lsk".to_string(), "LSK/EUR".to_string());
+        map.insert("omg".to_string(), "OMG/EUR".to_string());
+        map.insert("omisego".to_string(), "OMG/EUR".to_string());
+        map.insert("paxg".to_string(), "PAXG/EUR".to_string());
+        map.insert("pax-gold".to_string(), "PAXG/EUR".to_string());
+        map.insert("rep".to_string(), "REP/EUR".to_string());
+        map.insert("augur".to_string(), "REP/EUR".to_string());
+        map.insert("sc".to_string(), "SC/EUR".to_string());
+        map.insert("siacoin".to_string(), "SC/EUR".to_string());
+        map.insert("storj".to_string(), "STORJ/EUR".to_string());
+        map.insert("wtc".to_string(), "WTC/EUR".to_string());
+        map.insert("waltonchain".to_string(), "WTC/EUR".to_string());
+        map.insert("xbt".to_string(), "BTC/EUR".to_string()); // Alias voor BTC
+        map.insert("horizen".to_string(), "ZEN/EUR".to_string());
+        map.insert("zen".to_string(), "ZEN/EUR".to_string());
+        map.insert("digibyte".to_string(), "DGB/EUR".to_string());
+        map.insert("dgb".to_string(), "DGB/EUR".to_string());
+        map.insert("peercoin".to_string(), "PPC/EUR".to_string());
+        map.insert("ppc".to_string(), "PPC/EUR".to_string());
+        map.insert("namecoin".to_string(), "NMC/EUR".to_string());
+        map.insert("nmc".to_string(), "NMC/EUR".to_string());
+        map.insert("novacoin".to_string(), "NVC/EUR".to_string());
+        map.insert("nvc".to_string(), "NVC/EUR".to_string());
+        map.insert("feathercoin".to_string(), "FTC/EUR".to_string());
+        map.insert("ftc".to_string(), "FTC/EUR".to_string());
+        map.insert("primecoin".to_string(), "XPM/EUR".to_string());
+        map.insert("xpm".to_string(), "XPM/EUR".to_string());
+        map.insert("quark".to_string(), "QRK/EUR".to_string());
+        map.insert("qrk".to_string(), "QRK/EUR".to_string());
+        map.insert("anoncoin".to_string(), "ANC/EUR".to_string());
+        map.insert("anc".to_string(), "ANC/EUR".to_string());
+        map.insert("blackcoin".to_string(), "BLK/EUR".to_string());
+        map.insert("blk".to_string(), "BLK/EUR".to_string());
+        map.insert("curecoin".to_string(), "CURE/EUR".to_string());
+        map.insert("cure".to_string(), "CURE/EUR".to_string());
+        map.insert("digitalcoin".to_string(), "DGC/EUR".to_string());
+        map.insert("dgc".to_string(), "DGC/EUR".to_string());
+        map.insert("einsteinium".to_string(), "EMC2/EUR".to_string());
+        map.insert("emc2".to_string(), "EMC2/EUR".to_string());
+        map.insert("goldcoin".to_string(), "GLD/EUR".to_string());
+        map.insert("gld".to_string(), "GLD/EUR".to_string());
+        map.insert("infinitecoin".to_string(), "IFC/EUR".to_string());
+        map.insert("ifc".to_string(), "IFC/EUR".to_string());
+        map.insert("ixcoin".to_string(), "IXC/EUR".to_string());
+        map.insert("ixc".to_string(), "IXC/EUR".to_string());
+        map.insert("megacoin".to_string(), "MEC/EUR".to_string());
+        map.insert("mec".to_string(), "MEC/EUR".to_string());
+        map.insert("mincoin".to_string(), "MNC/EUR".to_string());
+        map.insert("mnc".to_string(), "MNC/EUR".to_string());
+        map.insert("onecoin".to_string(), "ONE/EUR".to_string());
+        map.insert("tagcoin".to_string(), "TAG/EUR".to_string());
+        map.insert("tag".to_string(), "TAG/EUR".to_string());
+        map.insert("worldcoin".to_string(), "WDC/EUR".to_string());
+        map.insert("wdc".to_string(), "WDC/EUR".to_string());
+        map.insert("yacoin".to_string(), "YAC/EUR".to_string());
+        map.insert("yac".to_string(), "YAC/EUR".to_string());
+        map.insert("zetacoin".to_string(), "ZET/EUR".to_string());
+        map.insert("zet".to_string(), "ZET/EUR".to_string());
+        map.insert("42-coin".to_string(), "42/EUR".to_string());
+        map.insert("bitmark".to_string(), "BTM/EUR".to_string());
+        map.insert("btm".to_string(), "BTM/EUR".to_string());
+        map.insert("clams".to_string(), "CLAM/EUR".to_string());
+        map.insert("clam".to_string(), "CLAM/EUR".to_string());
+        map.insert("diamond".to_string(), "DMD/EUR".to_string()); // Toegevoegd voor DMD/EUR matching
+        map.insert("dmd".to_string(), "DMD/EUR".to_string());
+        map.insert("fluorine".to_string(), "F/EUR".to_string()); // Toegevoegd voor F/EUR matching
+        map.insert("f".to_string(), "F/EUR".to_string());
+        map.insert("garlicoin".to_string(), "GRLC/EUR".to_string());
+        map.insert("grlc".to_string(), "GRLC/EUR".to_string());
+        map.insert("hobonickels".to_string(), "HBN/EUR".to_string());
+        map.insert("hbn".to_string(), "HBN/EUR".to_string());
+        map.insert("iocoin".to_string(), "IOC/EUR".to_string());
+        map.insert("ioc".to_string(), "IOC/EUR".to_string());
+        map.insert("joulecoin".to_string(), "XJO/EUR".to_string());
+        map.insert("xjo".to_string(), "XJO/EUR".to_string());
+        map.insert("lotus".to_string(), "LOT/EUR".to_string());
+        map.insert("lot".to_string(), "LOT/EUR".to_string());
+        map.insert("mooncoin".to_string(), "MOON/EUR".to_string());
+        map.insert("moon".to_string(), "MOON/EUR".to_string());
+        map.insert("nyancoin".to_string(), "NYAN/EUR".to_string());
+        map.insert("nyan".to_string(), "NYAN/EUR".to_string());
+        map.insert("phoenixcoin".to_string(), "PXC/EUR".to_string());
+        map.insert("pxc".to_string(), "PXC/EUR".to_string());
+        map.insert("reddcoin".to_string(), "RDD/EUR".to_string());
+        map.insert("rdd".to_string(), "RDD/EUR".to_string());
+        map.insert("sexcoin".to_string(), "SXC/EUR".to_string());
+        map.insert("sxc".to_string(), "SXC/EUR".to_string());
+        map.insert("tickets".to_string(), "TIX/EUR".to_string());
+        map.insert("tix".to_string(), "TIX/EUR".to_string());
+        map.insert("unobtanium".to_string(), "UNO/EUR".to_string());
+        map.insert("uno".to_string(), "UNO/EUR".to_string());
+        map.insert("vcash".to_string(), "XVC/EUR".to_string());
+        map.insert("xvc".to_string(), "XVC/EUR".to_string());
+        map.insert("whitecoin".to_string(), "XWC/EUR".to_string());
+        map.insert("xwc".to_string(), "XWC/EUR".to_string());
+        map.insert("cagecoin".to_string(), "CAGE/EUR".to_string());
+        map.insert("cage".to_string(), "CAGE/EUR".to_string());
+        map.insert("cryptogenic".to_string(), "BULLET/EUR".to_string());
+        map.insert("bullet".to_string(), "BULLET/EUR".to_string());
+        map.insert("diamondcash".to_string(), "DMC/EUR".to_string());
+        map.insert("dmc".to_string(), "DMC/EUR".to_string());
+        map.insert("ecocoin".to_string(), "ECO/EUR".to_string()); // Toegevoegd voor ECO/EUR matching
+        map.insert("eco".to_string(), "ECO/EUR".to_string());
+        map.insert("fluttercoin".to_string(), "FLT/EUR".to_string());
+        map.insert("flt".to_string(), "FLT/EUR".to_string());
+        map.insert("freicoin".to_string(), "FRC/EUR".to_string());
+        map.insert("frc".to_string(), "FRC/EUR".to_string());
+        map.insert("globalcoin".to_string(), "GLC/EUR".to_string());
+        map.insert("glc".to_string(), "GLC/EUR".to_string());
+        map.insert("karmacoin".to_string(), "KARMA/EUR".to_string());
+        map.insert("karma".to_string(), "KARMA/EUR".to_string());
+        map.insert("orbitcoin".to_string(), "ORB/EUR".to_string());
+        map.insert("orb".to_string(), "ORB/EUR".to_string());
+        map.insert("potcoin".to_string(), "POT/EUR".to_string());
+        map.insert("pot".to_string(), "POT/EUR".to_string());
+        map.insert("royalcoin".to_string(), "ROYAL/EUR".to_string());
+        map.insert("royal".to_string(), "ROYAL/EUR".to_string());
+        map.insert("sativacoin".to_string(), "STV/EUR".to_string());
+        map.insert("stv".to_string(), "STV/EUR".to_string());
+        map.insert("solarcoin".to_string(), "SLR/EUR".to_string());
+        map.insert("slr".to_string(), "SLR/EUR".to_string());
+        map.insert("spreadcoin".to_string(), "SPR/EUR".to_string());
+        map.insert("spr".to_string(), "SPR/EUR".to_string());
+        map.insert("startcoin".to_string(), "START/EUR".to_string());
+        map.insert("start".to_string(), "START/EUR".to_string());
+        map.insert("swagbucks".to_string(), "BUCKS/EUR".to_string());
+        map.insert("bucks".to_string(), "BUCKS/EUR".to_string());
+        map.insert("synergy".to_string(), "SNRG/EUR".to_string());
+        map.insert("snrg".to_string(), "SNRG/EUR".to_string());
+        map.insert("tekcoin".to_string(), "TEK/EUR".to_string());
+        map.insert("tek".to_string(), "TEK/EUR".to_string());
+        map.insert("titcoin".to_string(), "TIT/EUR".to_string()); // Toegevoegd voor TIT/EUR matching
+        map.insert("tit".to_string(), "TIT/EUR".to_string());
+        map.insert("trollcoin".to_string(), "TROLL/EUR".to_string());
+        map.insert("troll".to_string(), "TROLL/EUR".to_string());
+        map.insert("unbreakable".to_string(), "UNB/EUR".to_string());
+        map.insert("unb".to_string(), "UNB/EUR".to_string());
+        map.insert("universalcoin".to_string(), "UNIC/EUR".to_string());
+        map.insert("unic".to_string(), "UNIC/EUR".to_string());
+        map.insert("viacoin".to_string(), "VIA/EUR".to_string());
+        map.insert("via".to_string(), "VIA/EUR".to_string());
+        map.insert("voxels".to_string(), "VOX/EUR".to_string());
+        map.insert("vox".to_string(), "VOX/EUR".to_string());
+        map.insert("wildbeast".to_string(), "WBB/EUR".to_string());
+        map.insert("wbb".to_string(), "WBB/EUR".to_string());
+        map.insert("xaurum".to_string(), "XAUR/EUR".to_string());
+        map.insert("xaur".to_string(), "XAUR/EUR".to_string());
+        map.insert("zelcash".to_string(), "ZEL/EUR".to_string());
+        map.insert("zel".to_string(), "ZEL/EUR".to_string());
+        map.insert("zero".to_string(), "ZER/EUR".to_string());
+        map.insert("zer".to_string(), "ZER/EUR".to_string());
+        map.insert("latium".to_string(), "LAT/EUR".to_string()); // Toegevoegd voor LAT/EUR matching
+        map.insert("lat".to_string(), "LAT/EUR".to_string());
+        map.insert("version".to_string(), "V/EUR".to_string()); // Toegevoegd voor V/EUR matching
+        map.insert("v".to_string(), "V/EUR".to_string());
+        map.insert("okcash".to_string(), "OK/EUR".to_string()); // Toegevoegd voor OK/EUR matching
+        map.insert("ok".to_string(), "OK/EUR".to_string());
+        map.insert("f/m".to_string(), "F/EUR".to_string()); // Extra voor F/EUR
+        map
+    };
+    
+    // Pre-sorted keywords by length (descending) for efficient matching
+    static ref SORTED_KEYWORDS: Vec<(String, String)> = {
+        let mut keywords: Vec<(String, String)> = KEYWORD_MAP
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        keywords.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        keywords
+    };
+}
+
+lazy_static! {
+    static ref SENTIMENT_MAP: HashMap<String, Vec<(String, i32)>> = {
+        let mut map = HashMap::new();
+        // Hardcoded positive words
+        let positive = vec![
+            ("bull".to_string(), 2),
+            ("rally".to_string(), 2),
+            ("surge".to_string(), 3),
+            ("pump".to_string(), 3),
+            ("rise".to_string(), 1),
+            ("green".to_string(), 1),
+            ("up".to_string(), 1),
+            ("buy".to_string(), 2),
+            ("gain".to_string(), 1),
+            ("boom".to_string(), 3),
+            ("soar".to_string(), 2),
+        ];
+        // Hardcoded negative words
+        let negative = vec![
+            ("bear".to_string(), 2),
+            ("crash".to_string(), 3),
+            ("dump".to_string(), 3),
+            ("fall".to_string(), 1),
+            ("red".to_string(), 1),
+            ("down".to_string(), 1),
+            ("sell".to_string(), 2),
+            ("drop".to_string(), 1),
+            ("decline".to_string(), 1),
+            ("plunge".to_string(), 3),
+            ("slump".to_string(), 2),
+        ];
+        map.insert("positive".to_string(), positive);
+        map.insert("negative".to_string(), negative);
+        map
+    };
+}
 
 // ============================================================================
 // HOOFDSTUK 1 – CONFIGURATIE & CONSTANTES
@@ -306,14 +601,12 @@ struct TradeState {
     whale_pred_score: f64,
     whale_pred_label: Option<String>,
     last_update_ts: i64,
+    news_sentiment: f64,
     recent_anom: bool,
     last_whale_pred_high: bool,
     // NIEUW: Counters voor aantal trades per side
     buy_trades: u64,
     sell_trades: u64,
-    // NIEUW: Flow duration tracking
-    current_flow_start: i64,
-    flow_durations: HashMap<String, Vec<i64>>,  // Key: "BUY", "SELL", "NEUTRAL"; Value: Vec of durations in seconds
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -374,13 +667,12 @@ struct Row {
     whale_pred_label: String,
     reliability_score: f64,
     reliability_label: String,
+    news_sentiment: f64,
     // NIEUW: Voor Count Trades kolom
     buy_trades: u64,
     sell_trades: u64,
     // NIEUW: Time kolom voor Markets tabblad
     ts: i64,
-    // NIEUW: Duration DIR kolom
-    duration_dir: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -408,8 +700,6 @@ struct SignalEvent {
     evaluated: bool,
     ret_5m: Option<f64>,
     eval_horizon_sec: Option<i64>,
-    // NIEUW: Duration DIR kolom
-    duration_dir: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -440,8 +730,6 @@ struct TopRow {
     // NIEUW: Voor Count Trades kolom in Top 10
     buy_trades: u64,
     sell_trades: u64,
-    // NIEUW: Duration DIR kolom
-    duration_dir: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -756,6 +1044,7 @@ struct Engine {
     signalled_pairs: Arc<DashMap<String, bool>>,
     weights: Arc<Mutex<ScoreWeights>>,
     manual_trader: Arc<Mutex<ManualTraderState>>,
+    news_sentiment: Arc<DashMap<String, (f64, i64, String)>>,
     stars_history: Arc<Mutex<StarsHistory>>,
 }
 
@@ -770,6 +1059,7 @@ impl Engine {
             signalled_pairs: Arc::new(DashMap::new()),
             weights: Arc::new(Mutex::new(ScoreWeights::default())),
             manual_trader: Arc::new(Mutex::new(ManualTraderState::new())),
+            news_sentiment: Arc::new(DashMap::new()),
             stars_history: Arc::new(Mutex::new(StarsHistory { history: Vec::new(), dirty: false })),
         }
     }
@@ -785,6 +1075,19 @@ impl Engine {
         if buf.len() > 400 {
             let overflow = buf.len() - 400;
             buf.drain(0..overflow);
+        }
+    }
+
+    fn update_sentiment(&self, pair: &str, sentiment: f64, title: &str) {
+        self.news_sentiment.insert(pair.to_string(), (sentiment, Utc::now().timestamp(), title.to_string()));
+        if let Some(mut ts) = self.trades.get_mut(pair) {
+            ts.news_sentiment = sentiment;
+            ts.last_update_ts = Utc::now().timestamp();
+            if sentiment > 0.7 {
+                ts.last_score *= 1.1;
+            } else if sentiment < 0.3 {
+                ts.last_score *= 0.95;
+            }
         }
     }
 
@@ -940,24 +1243,6 @@ impl Engine {
 
         t.last_flow_pct = flow_pct;
         t.last_dir = dir.clone();
-
-        // NIEUW: Detect flow change and record duration
-        if t.current_flow_start == 0 {
-            t.current_flow_start = ts_int;
-        } else if t.last_dir != dir {
-            // Flow changed, record duration
-            let duration = ts_int - t.current_flow_start;
-            if duration > 0 {
-                t.flow_durations.entry(t.last_dir.clone()).or_insert_with(Vec::new).push(duration);
-                // Keep only last 100 durations to save memory
-                if let Some(durs) = t.flow_durations.get_mut(&t.last_dir) {
-                    if durs.len() > 100 {
-                        durs.remove(0);
-                    }
-                }
-            }
-            t.current_flow_start = ts_int;
-        }
 
         let cutoff5 = ts - 300.0;
         if side == "b" {
@@ -1306,7 +1591,6 @@ impl Engine {
                 let whale_side = t.last_whale_side.clone().unwrap_or_else(|| "-".to_string());
                 let whale_volume = t.last_whale_volume.unwrap_or(0.0);
                 let whale_notional = t.last_whale_notional.unwrap_or(0.0);
-                let duration_dir = compute_flow_durations(&t).get(&dir).copied().unwrap_or(0.0) / 60.0;
                 let row = TopRow {
                     ts: ts_int,
                     pair: pair.to_string(),
@@ -1347,17 +1631,17 @@ impl Engine {
                         rating: rating.clone(), 
                         whale_pred_score, 
                         whale_pred_label: whale_pred_label.clone(), 
-                        reliability_score: compute_reliability(&t, ts_int).0, 
-                        reliability_label: compute_reliability(&t, ts_int).1, 
+                        reliability_score: Self::compute_reliability(&t, ts_int).0, 
+                        reliability_label: Self::compute_reliability(&t, ts_int).1, 
+                        news_sentiment: t.news_sentiment, 
                         buy_trades: t.buy_trades, 
                         sell_trades: t.sell_trades, 
                         ts: ts_int, // NIEUW: ts veld toegevoegd
-                        duration_dir,
                     }),
                     whale_pred_score,
                     whale_pred_label: whale_pred_label.clone(),
-                    reliability_score: compute_reliability(&t, ts_int).0,
-                    reliability_label: compute_reliability(&t, ts_int).1,
+                    reliability_score: Self::compute_reliability(&t, ts_int).0,
+                    reliability_label: Self::compute_reliability(&t, ts_int).1,
                     signal_type: "WH_PRED".to_string(),
                     confidence: compute_confidence(&Row { 
                         pair: pair.to_string(), 
@@ -1384,13 +1668,13 @@ impl Engine {
                         rating: rating.clone(), 
                         whale_pred_score, 
                         whale_pred_label: whale_pred_label.clone(), 
-                        reliability_score: compute_reliability(&t, ts_int).0, 
-                        reliability_label: compute_reliability(&t, ts_int).1, 
+                        reliability_score: Self::compute_reliability(&t, ts_int).0, 
+                        reliability_label: Self::compute_reliability(&t, ts_int).1, 
+                        news_sentiment: t.news_sentiment, 
                         buy_trades: t.buy_trades, 
                         sell_trades: t.sell_trades, 
                         ts: ts_int, // NIEUW: ts veld toegevoegd
-                        duration_dir,
-                    }, t.trade_count as usize, compute_reliability(&t, ts_int).0),
+                    }, t.trade_count as usize, Self::compute_reliability(&t, ts_int).0),
                     momentum: compute_momentum(pct, pump_score, flow_pct),
                     trade_score: compute_trade_score(
                         compute_momentum(pct, pump_score, flow_pct),
@@ -1419,14 +1703,14 @@ impl Engine {
                             rating: rating.clone(), 
                             whale_pred_score, 
                             whale_pred_label: whale_pred_label.clone(), 
-                            reliability_score: compute_reliability(&t, ts_int).0, 
-                            reliability_label: compute_reliability(&t, ts_int).1, 
+                            reliability_score: Self::compute_reliability(&t, ts_int).0, 
+                            reliability_label: Self::compute_reliability(&t, ts_int).1, 
+                            news_sentiment: t.news_sentiment, 
                             buy_trades: t.buy_trades, 
                             sell_trades: t.sell_trades, 
                             ts: ts_int, // NIEUW: ts veld toegevoegd
-                            duration_dir,
-                        }, t.trade_count as usize, compute_reliability(&t, ts_int).0),
-                        compute_reliability(&t, ts_int).0,
+                        }, t.trade_count as usize, Self::compute_reliability(&t, ts_int).0),
+                        Self::compute_reliability(&t, ts_int).0,
                         whale_pred_score,
                         pump_score,
                         flow_pct,
@@ -1434,7 +1718,6 @@ impl Engine {
                     ),
                     buy_trades: t.buy_trades,
                     sell_trades: t.sell_trades,
-                    duration_dir,
                 };
                 self.add_to_stars_history(row);
             } else {
@@ -1443,7 +1726,6 @@ impl Engine {
         }
 
         if whale_pred_label == "HIGH" && prev_pred_label != "HIGH" {
-            let duration_dir = compute_flow_durations(&t).get(&dir).copied().unwrap_or(0.0) / 60.0;
             let ev = SignalEvent {
                 ts: ts_int,
                 pair: pair.to_string(),
@@ -1468,13 +1750,11 @@ impl Engine {
                 evaluated: false,
                 ret_5m: None,
                 eval_horizon_sec: None,
-                duration_dir,
             };
             self.push_signal(ev);
         }
 
         if pump_label != "NONE" && pump_label != prev_pump_sig {
-            let duration_dir = compute_flow_durations(&t).get(&dir).copied().unwrap_or(0.0) / 60.0;
             let ev = SignalEvent {
                 ts: ts_int,
                 pair: pair.to_string(),
@@ -1499,13 +1779,11 @@ impl Engine {
                 evaluated: false,
                 ret_5m: None,
                 eval_horizon_sec: None,
-                duration_dir,
             };
             self.push_signal(ev);
         }
 
         if is_whale && !prev_whale {
-            let duration_dir = compute_flow_durations(&t).get(&dir).copied().unwrap_or(0.0) / 60.0;
             let ev = SignalEvent {
                 ts: ts_int,
                 pair: pair.to_string(),
@@ -1534,13 +1812,11 @@ impl Engine {
                 evaluated: false,
                 ret_5m: None,
                 eval_horizon_sec: None,
-                duration_dir,
             };
             self.push_signal(ev);
         }
 
         if new_early != "NONE" && new_early != prev_early {
-            let duration_dir = compute_flow_durations(&t).get(&dir).copied().unwrap_or(0.0) / 60.0;
             let ev = SignalEvent {
                 ts: ts_int,
                 pair: pair.to_string(),
@@ -1565,13 +1841,11 @@ impl Engine {
                 evaluated: false,
                 ret_5m: None,
                 eval_horizon_sec: None,
-                duration_dir,
             };
             self.push_signal(ev);
         }
 
         if new_alpha != "NONE" && new_alpha != prev_alpha {
-            let duration_dir = compute_flow_durations(&t).get(&dir).copied().unwrap_or(0.0) / 60.0;
             let ev = SignalEvent {
                 ts: ts_int,
                 pair: pair.to_string(),
@@ -1596,7 +1870,6 @@ impl Engine {
                 evaluated: false,
                 ret_5m: None,
                 eval_horizon_sec: None,
-                duration_dir,
             };
             self.push_signal(ev);
         }
@@ -1703,9 +1976,8 @@ impl Engine {
                 let rating = t.last_rating.clone().unwrap_or_else(|| "NONE".to_string());
                 let whale_pred_score = t.whale_pred_score;
                 let whale_pred_label = t.whale_pred_label.clone().unwrap_or_else(|| "NONE".to_string());
-                let reliability_score = compute_reliability(&t, ts_int).0;
-                let reliability_label = compute_reliability(&t, ts_int).1;
-                let duration_dir = compute_flow_durations(&t).get(&dir).copied().unwrap_or(0.0) / 60.0;
+                let reliability_score = Self::compute_reliability(&t, ts_int).0;
+                let reliability_label = Self::compute_reliability(&t, ts_int).1;
                 let row = TopRow {
                     ts: ts_int,
                     pair: pair.to_string(),
@@ -1748,15 +2020,15 @@ impl Engine {
                         whale_pred_label: whale_pred_label.clone(), 
                         reliability_score, 
                         reliability_label: reliability_label.clone(), 
+                        news_sentiment: t.news_sentiment, 
                         buy_trades: t.buy_trades, 
                         sell_trades: t.sell_trades, 
                         ts: ts_int, // NIEUW: ts veld toegevoegd
-                        duration_dir,
                     }),
                     whale_pred_score,
                     whale_pred_label: whale_pred_label.clone(),
                     reliability_score,
-                    reliability_label: compute_reliability(&t, ts_int).1,
+                    reliability_label: Self::compute_reliability(&t, ts_int).1,
                     signal_type: "ANOM".to_string(),
                     confidence: compute_confidence(&Row { 
                         pair: pair.to_string(), 
@@ -1784,12 +2056,12 @@ impl Engine {
                         whale_pred_score, 
                         whale_pred_label: whale_pred_label.clone(), 
                         reliability_score, 
-                        reliability_label: compute_reliability(&t, ts_int).1, 
+                        reliability_label: Self::compute_reliability(&t, ts_int).1, 
+                        news_sentiment: t.news_sentiment, 
                         buy_trades: t.buy_trades, 
                         sell_trades: t.sell_trades, 
                         ts: ts_int, // NIEUW: ts veld toegevoegd
-                        duration_dir,
-                    }, t.trade_count as usize, compute_reliability(&t, ts_int).0),
+                    }, t.trade_count as usize, Self::compute_reliability(&t, ts_int).0),
                     momentum: compute_momentum(pct, pump_score, t.last_flow_pct),
                     trade_score: compute_trade_score(
                         compute_momentum(pct, pump_score, t.last_flow_pct),
@@ -1819,13 +2091,13 @@ impl Engine {
                             whale_pred_score, 
                             whale_pred_label: whale_pred_label.clone(), 
                             reliability_score, 
-                            reliability_label: compute_reliability(&t, ts_int).1, 
+                            reliability_label: Self::compute_reliability(&t, ts_int).1, 
+                            news_sentiment: t.news_sentiment, 
                             buy_trades: t.buy_trades, 
                             sell_trades: t.sell_trades, 
                             ts: ts_int, // NIEUW: ts veld toegevoegd
-                            duration_dir,
-                        }, t.trade_count as usize, compute_reliability(&t, ts_int).0),
-                        compute_reliability(&t, ts_int).0,
+                        }, t.trade_count as usize, Self::compute_reliability(&t, ts_int).0),
+                        Self::compute_reliability(&t, ts_int).0,
                         whale_pred_score,
                         pump_score,
                         t.last_flow_pct,
@@ -1833,12 +2105,10 @@ impl Engine {
                     ),
                     buy_trades: t.buy_trades,
                     sell_trades: t.sell_trades,
-                    duration_dir,
                 };
                 self.add_to_stars_history(row);
             }
 
-            let duration_dir = compute_flow_durations(&t).get(&dir).copied().unwrap_or(0.0) / 60.0;
             let ev = SignalEvent {
                 ts: ts_int,
                 pair: pair.to_string(),
@@ -1863,10 +2133,109 @@ impl Engine {
                 evaluated: true,
                 ret_5m: None,
                 eval_horizon_sec: None,
-                duration_dir,
             };
             self.push_signal(ev);
         }
+    }
+
+    fn compute_reliability(t: &TradeState, now_ts: i64) -> (f64, String) {
+        let now_f = now_ts as f64;
+
+        let cutoff_60 = now_f - 60.0;
+        let cutoff_300 = now_f - 300.0;
+
+        let mut recent_trades_60: usize = 0;
+        let _vol_60: f64 = 0.0;
+        for (_ts, _v) in t.recent_buys.iter().chain(t.recent_sells.iter()) {
+            if *_ts >= cutoff_60 {
+                recent_trades_60 += 1;
+            }
+        }
+
+        let mut vol_300: f64 = 0.0;
+        for (_ts, v) in t.recent_buys_5m.iter().chain(t.recent_sells_5m.iter()) {
+            if *_ts >= cutoff_300 {
+                vol_300 += *v;
+            }
+        }
+
+        let td = (recent_trades_60.min(30) as f64 / 30.0) * 40.0;
+
+        let ew_v = t.ewma_volume.unwrap_or(vol_300.max(1e-9));
+        let vol_ratio = if ew_v > 0.0 { vol_300 / ew_v } else { 1.0 };
+
+        let vs = if vol_ratio > 4.0 {
+            0.0
+        } else if vol_ratio > 2.0 {
+            10.0
+        } else {
+            20.0
+        };
+
+        let mut buys_60: f64 = 0.0;
+        let mut sells_60: f64 = 0.0;
+        for (_ts, v) in t.recent_buys.iter() {
+            if *_ts >= cutoff_60 {
+                buys_60 += *v;
+            }
+        }
+        for (_ts, v) in t.recent_sells.iter() {
+            if *_ts >= cutoff_60 {
+                sells_60 += *v;
+            }
+        }
+        let tot_60 = buys_60 + sells_60;
+        let flow_pct_60 = if tot_60 > 0.0 {
+            buys_60 / tot_60 * 100.0
+        } else {
+            50.0
+        };
+
+        let fc = if tot_60 < 1.0 {
+            0.0
+        } else if flow_pct_60 > 70.0 || flow_pct_60 < 30.0 {
+            20.0
+        } else {
+            15.0
+        };
+
+        let dt = now_ts.saturating_sub(t.last_update_ts);
+        // AANBEVELING 4: Verleng age-penalty in rel_score naar 10 minuten
+        let ras = if dt > 600 {  // 10 minuten in plaats van 300 (5 min)
+            0.0
+        } else if dt > 300 {
+            5.0
+        } else if dt > 120 {
+            10.0
+        } else {
+            15.0
+        };
+
+        let tds = if recent_trades_60 >= 20 {
+            15.0
+        } else if recent_trades_60 >= 5 {
+            8.0
+        } else {
+            0.0
+        };
+
+        let mut score = td + vs + fc + ras + tds;
+        if score > 100.0 {
+            score = 100.0;
+        }
+
+        let label = if score <= 25.0 {
+            "UNRELIABLE"
+        } else if score <= 50.0 {
+            "LOW"
+        } else if score <= 75.0 {
+            "MEDIUM"
+        } else {
+            "HIGH"
+        }
+        .to_string();
+
+        (score, label)
     }
 
     fn snapshot(&self) -> Vec<Row> {
@@ -1932,9 +2301,7 @@ impl Engine {
                 .clone()
                 .unwrap_or_else(|| "NONE".to_string());
 
-            let (reliability_score, reliability_label) = compute_reliability(&v, now_ts);
-
-            let duration_dir = compute_flow_durations(&v).get(&dir).copied().unwrap_or(0.0) / 60.0;
+            let (reliability_score, reliability_label) = Self::compute_reliability(&v, now_ts);
 
             rows.push(Row {
                 pair: pair.clone(),
@@ -1966,10 +2333,10 @@ impl Engine {
                 whale_pred_label,
                 reliability_score,
                 reliability_label,
+                news_sentiment: self.news_sentiment.get(&pair).map(|v| v.0).unwrap_or(0.5),
                 buy_trades: v.buy_trades,
                 sell_trades: v.sell_trades,
                 ts: v.last_update_ts, // NIEUW: ts veld toegevoegd voor Time kolom in Markets
-                duration_dir,
             });
         }
 
@@ -2210,7 +2577,6 @@ impl Engine {
                     ),
                     buy_trades: r.buy_trades,
                     sell_trades: r.sell_trades,
-                    duration_dir: r.duration_dir, // NIEUW: duration_dir veld gebruikt
                 }
             })
             .collect();
@@ -2296,7 +2662,6 @@ impl Engine {
                     ),
                     buy_trades: r.buy_trades,
                     sell_trades: r.sell_trades,
-                    duration_dir: r.duration_dir, // NIEUW: duration_dir veld gebruikt
                 }
             })
             .collect();
@@ -2486,123 +2851,6 @@ impl Engine {
 }
 
 // ============================================================================
-// HOOFDSTUK 7 – BETROUWBAARHEID & KWALITEITSSCORES
-// ============================================================================
-
-fn compute_reliability(t: &TradeState, now_ts: i64) -> (f64, String) {
-    let now_f = now_ts as f64;
-
-    let cutoff_60 = now_f - 60.0;
-    let cutoff_300 = now_f - 300.0;
-
-    let mut recent_trades_60: usize = 0;
-    let _vol_60: f64 = 0.0;
-    for (_ts, _v) in t.recent_buys.iter().chain(t.recent_sells.iter()) {
-        if *_ts >= cutoff_60 {
-            recent_trades_60 += 1;
-        }
-    }
-
-    let mut vol_300: f64 = 0.0;
-    for (_ts, v) in t.recent_buys_5m.iter().chain(t.recent_sells_5m.iter()) {
-        if *_ts >= cutoff_300 {
-            vol_300 += *v;
-        }
-    }
-
-    let td = (recent_trades_60.min(30) as f64 / 30.0) * 40.0;
-
-    let ew_v = t.ewma_volume.unwrap_or(vol_300.max(1e-9));
-    let vol_ratio = if ew_v > 0.0 { vol_300 / ew_v } else { 1.0 };
-
-    let vs = if vol_ratio > 4.0 {
-        0.0
-    } else if vol_ratio > 2.0 {
-        10.0
-    } else {
-        20.0
-    };
-
-    let mut buys_60: f64 = 0.0;
-    let mut sells_60: f64 = 0.0;
-    for (_ts, v) in t.recent_buys.iter() {
-        if *_ts >= cutoff_60 {
-            buys_60 += *v;
-        }
-    }
-    for (_ts, v) in t.recent_sells.iter() {
-        if *_ts >= cutoff_60 {
-            sells_60 += *v;
-        }
-    }
-    let tot_60 = buys_60 + sells_60;
-    let flow_pct_60 = if tot_60 > 0.0 {
-        buys_60 / tot_60 * 100.0
-    } else {
-        50.0
-    };
-
-    let fc = if tot_60 < 1.0 {
-        0.0
-    } else if flow_pct_60 > 70.0 || flow_pct_60 < 30.0 {
-        20.0
-    } else {
-        15.0
-    };
-
-    let dt = now_ts.saturating_sub(t.last_update_ts);
-    // AANBEVELING 4: Verleng age-penalty in rel_score naar 10 minuten
-    let ras = if dt > 600 {  // 10 minuten in plaats van 300 (5 min)
-        0.0
-    } else if dt > 300 {
-        5.0
-    } else if dt > 120 {
-        10.0
-    } else {
-        15.0
-    };
-
-    let tds = if recent_trades_60 >= 20 {
-        15.0
-    } else if recent_trades_60 >= 5 {
-        8.0
-    } else {
-        0.0
-    };
-
-    let mut score = td + vs + fc + ras + tds;
-    if score > 100.0 {
-        score = 100.0;
-    }
-
-    let label = if score <= 25.0 {
-        "UNRELIABLE"
-    } else if score <= 50.0 {
-        "LOW"
-    } else if score <= 75.0 {
-        "MEDIUM"
-    } else {
-        "HIGH"
-    }
-    .to_string();
-
-    (score, label)
-}
-
-// NIEUW: Functie om flow durations te berekenen
-fn compute_flow_durations(t: &TradeState) -> HashMap<String, f64> {
-    let mut avgs = HashMap::new();
-    for (dir, durs) in &t.flow_durations {
-        if !durs.is_empty() {
-            let sum: i64 = durs.iter().sum();
-            let avg = sum as f64 / durs.len() as f64;
-            avgs.insert(dir.clone(), avg);
-        }
-    }
-    avgs
-}
-
-// ============================================================================
 // HOOFDSTUK 8 – NORMALISATIE (ASSETS & PAIRS)
 // ============================================================================
 
@@ -2613,7 +2861,6 @@ fn normalize_asset(sym: &str) -> String {
         "XXRP" => "XRP".to_string(),
         "XDG" => "DOGE".to_string(),
         "XXLM" => "XLM".to_string(),
-        "ADA" => "ADA".to_string(),
         s => s.to_string(),
     }
 }
@@ -2751,6 +2998,7 @@ tr:nth-child(even){ background:#252525; }
     <button class="tab-btn" data-tab="backtest">Backtest</button>
     <button class="tab-btn" data-tab="heatmap">Heatmap</button>
     <button class="tab-btn" data-tab="stars">Stars</button>
+    <button class="tab-btn" data-tab="news">News</button>
     <button class="tab-btn" data-tab="health">Health</button>
     <button class="tab-btn" data-tab="config">Config</button>
     <button class="tab-btn" data-tab="guide">Guide</button>
@@ -2773,9 +3021,10 @@ tr:nth-child(even){ background:#252525; }
         <tr>
           <th>Time</th><th>Pair</th><th>Price</th><th>%</th><th>Whale</th>
           <th>Flow</th><th>Dir</th><th>Early</th><th>Alpha</th><th>Pump</th>
-          <th>WhPred</th><th>Rel</th><th>Total score</th><th>Trades</th><th>Buys</th><th>Sells</th>
+          <th>WhPred</th><th>Rel</th><th>News Sent.</th>
+          <th>Total score</th><th>Trades</th><th>Buys</th><th>Sells</th>
           <th>O</th><th>H</th><th>L</th><th>C</th>
-          <th>Duration DIR</th><th>Visual</th>
+          <th>Visual</th>
         </tr>
       </thead>
       <tbody></tbody>
@@ -2799,7 +3048,7 @@ tr:nth-child(even){ background:#252525; }
           <th>Time (ts)</th><th>Pair</th><th>Type</th><th>Dir</th>
           <th>Strength</th><th>Flow</th><th>%</th><th>Total score</th>
           <th>Whale</th><th>Vol</th><th>Notional</th><th>Price</th><th>Pump</th>
-          <th>Duration DIR</th><th>Visual</th>
+          <th>Visual</th>
         </tr>
       </thead>
       <tbody></tbody>
@@ -2823,7 +3072,7 @@ tr:nth-child(even){ background:#252525; }
         <tr>
           <th>Time</th><th>Pair</th><th>Price</th><th>%</th><th>Flow</th><th>Dir</th>
           <th>Early</th><th>Alpha</th><th>Whale</th><th>Pump</th>
-          <th>WhPred</th><th>Rel</th><th>Type</th><th>Confidence</th><th>Momentum</th><th>Trade Score</th><th>Count Trades</th><th>Duration DIR</th><th>Visual</th><th>Analyse</th>
+          <th>WhPred</th><th>Rel</th><th>Type</th><th>Confidence</th><th>Momentum</th><th>Trade Score</th><th>Count Trades</th><th>Visual</th><th>Analyse</th>
         </tr>
       </thead>
       <tbody></tbody>
@@ -2835,7 +3084,7 @@ tr:nth-child(even){ background:#252525; }
         <tr>
           <th>Time</th><th>Pair</th><th>Price</th><th>%</th><th>Flow</th><th>Dir</th>
           <th>Early</th><th>Alpha</th><th>Whale</th><th>Pump</th>
-          <th>WhPred</th><th>Rel</th><th>Type</th><th>Confidence</th><th>Momentum</th><th>Trade Score</th><th>Count Trades</th><th>Duration DIR</th><th>Visual</th><th>Analyse</th>
+          <th>WhPred</th><th>Rel</th><th>Type</th><th>Confidence</th><th>Momentum</th><th>Trade Score</th><th>Count Trades</th><th>Visual</th><th>Analyse</th>
         </tr>
       </thead>
       <tbody></tbody>
@@ -2847,7 +3096,7 @@ tr:nth-child(even){ background:#252525; }
         <tr>
           <th>Time</th><th>Pair</th><th>Price</th><th>%</th><th>Flow</th><th>Dir</th>
           <th>Early</th><th>Alpha</th><th>Whale</th><th>Pump</th>
-          <th>Rel</th><th>Type</th><th>Confidence</th><th>Momentum</th><th>Trade Score</th><th>Count Trades</th><th>Duration DIR</th><th>Visual</th><th>Analyse</th>
+          <th>Rel</th><th>Type</th><th>Confidence</th><th>Momentum</th><th>Trade Score</th><th>Count Trades</th><th>Visual</th><th>Analyse</th>
         </tr>
       </thead>
       <tbody></tbody>
@@ -3004,7 +3253,7 @@ tr:nth-child(even){ background:#252525; }
         <tr>
           <th>Time</th><th>Pair</th><th>Price</th><th>%</th><th>Flow</th><th>Dir</th>
           <th>Early</th><th>Alpha</th><th>Whale</th><th>Pump</th>
-          <th>WhPred</th><th>Rel</th><th>Type</th><th>Confidence</th><th>Momentum</th><th>Trade Score</th><th>Count Trades</th><th>Duration DIR</th><th>Visual</th><th>Analyse</th>
+          <th>WhPred</th><th>Rel</th><th>Type</th><th>Confidence</th><th>Momentum</th><th>Trade Score</th><th>Count Trades</th><th>Visual</th><th>Analyse</th>
         </tr>
       </thead>
       <tbody></tbody>
@@ -3015,7 +3264,23 @@ tr:nth-child(even){ background:#252525; }
         <tr>
           <th>Time</th><th>Pair</th><th>Price</th><th>%</th><th>Flow</th><th>Dir</th>
           <th>Early</th><th>Alpha</th><th>Whale</th><th>Pump</th>
-          <th>WhPred</th><th>Rel</th><th>Type</th><th>Confidence</th><th>Momentum</th><th>Trade Score</th><th>Count Trades</th><th>Duration DIR</th><th>Visual</th><th>Analyse</th>
+          <th>WhPred</th><th>Rel</th><th>Type</th><th>Confidence</th><th>Momentum</th><th>Trade Score</th><th>Count Trades</th><th>Visual</th><th>Analyse</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <div id="view-news" style="display:none;">
+    <div style="margin-bottom:10px;">
+      <label for="news-stable-filter">Include Stablecoins:</label>
+      <input type="checkbox" id="news-stable-filter" checked />
+    </div>
+    <h2>📰 News Sentiment</h2>
+    <table id="news-table">
+      <thead>
+        <tr>
+          <th>Pair</th><th>Sentiment</th><th>Last Update</th><th>Articles</th>
         </tr>
       </thead>
       <tbody></tbody>
@@ -3151,7 +3416,7 @@ tr:nth-child(even){ background:#252525; }
         <li><b>Momentum</b>: koopmoment score (0-100%) gebaseerd op %, Pump en Flow.</li>
         <li><b>Trade Score</b>: holistische beslissingscore (0-100%) voor koop/vermijd, met risico-penaliteiten.</li>
         <li><b>Count Trades</b>: aantal Buy en Sell trades, geformatteerd als "100_Buy / 30_Sell".</li>
-        <li><b>Duration DIR</b>: gemiddelde duur van de huidige flow richting in minuten.</li>
+        <li><b>News Sent.</b>: sentiment van recente nieuwsartikelen (0-1).</li>
         <li><b>Visual</b>: link naar de bijbehorende Kraken Pro grafiek.</li>
       </ul>
     </div>
@@ -3235,6 +3500,8 @@ function switchTab(tab) {
     tab === "heatmap" ? "block" : "none";
   document.getElementById("view-stars").style.display =
     tab === "stars" ? "block" : "none";
+  document.getElementById("view-news").style.display =
+    tab === "news" ? "block" : "none";
   document.getElementById("view-health").style.display =
     tab === "health" ? "block" : "none";
   document.getElementById("view-config").style.display =
@@ -3250,6 +3517,8 @@ function switchTab(tab) {
     loadManualTrades();
   } else if (tab === "stars") {
     loadStars();
+  } else if (tab === "news") {
+    loadNews();
   } else if (tab === "health") {
     loadHealth();
   } else if (tab === "config") {
@@ -3348,6 +3617,7 @@ async function loadMarkets() {
         "#ccc"}">${r.pump_score.toFixed(1)}</td>
       <td class="${predClass}">${r.whale_pred_label} (${r.whale_pred_score.toFixed(1)})</td>
       <td class="${relClass}">${r.reliability_label} (${r.reliability_score.toFixed(0)})</td>
+      <td>${r.news_sentiment ? r.news_sentiment.toFixed(2) : "0.50"}</td>
       <td>${r.score.toFixed(2)}</td>
       <td>${r.trades}</td>
       <td>${r.buys.toFixed(4)}</td>
@@ -3356,7 +3626,6 @@ async function loadMarkets() {
       <td>${r.h.toFixed(4)}</td>
       <td>${r.l.toFixed(4)}</td>
       <td>${r.c.toFixed(4)}</td>
-      <td>${r.duration_dir.toFixed(1)} min</td>
       <td>${visual}</td>
     </tr>`;
 
@@ -3420,7 +3689,6 @@ async function loadSignals() {
       <td>${(r.notional/1000).toFixed(1)}k</td>
       <td>${r.price.toFixed(4)}</td>
       <td style="color:${pumpColor}">${pumpText}</td>
-      <td>${r.duration_dir.toFixed(1)} min</td>
       <td>${visual}</td>
     </tr>`;
 
@@ -3492,7 +3760,6 @@ async function loadTop10() {
         <td>${r.momentum.toFixed(1)}%</td>
         <td>${r.trade_score.toFixed(1)}</td>
         <td>${countTradesText}</td>
-        <td>${r.duration_dir.toFixed(1)} min</td>
         <td>${visual}</td>
         <td>${r.analysis}</td>
       </tr>`;
@@ -3522,7 +3789,6 @@ async function loadTop10() {
         <td>${r.momentum.toFixed(1)}%</td>
         <td>${r.trade_score.toFixed(1)}</td>
         <td>${countTradesText}</td>
-        <td>${r.duration_dir.toFixed(1)} min</td>
         <td>${visual}</td>
         <td>${r.analysis}</td>
       </tr>`;
@@ -4106,7 +4372,6 @@ async function loadStars() {
               <td>${r.momentum.toFixed(1)}%</td>
               <td>${r.trade_score.toFixed(1)}</td>
               <td>${r.buy_trades}_Buy / ${r.sell_trades}_Sell</td>
-              <td>${r.duration_dir.toFixed(1)} min</td>
               <td>${visual}</td>
               <td>${r.analysis}</td>
             </tr>`;
@@ -4139,6 +4404,29 @@ async function loadStars() {
     })
     .catch(err => console.error("stars error", err));
 }
+
+async function loadNews() {
+  let includeStable = document.getElementById("news-stable-filter").checked;
+  fetch("/api/news")
+    .then(r => r.json())
+    .then(data => {
+      let tbody = document.querySelector("#news-table tbody");
+      tbody.innerHTML = "";
+      for (let r of data.filter(row => includeStable || !isStablecoin(row.pair))) {
+        let sentiment = r.sentiment || 0.5;
+        let classSent = sentiment > 0.7 ? "pos" : (sentiment < 0.3 ? "neg" : "");
+        tbody.innerHTML += `<tr>
+          <td>${r.pair}</td>
+          <td class="${classSent}">${sentiment.toFixed(2)}</td>
+          <td>${new Date(r.last_update * 1000).toLocaleString()}</td>
+          <td>${r.articles}</td>
+        </tr>`;
+      }
+    })
+    .catch(err => console.error("news error", err));
+}
+
+let healthLoaded = false; // NIEUW: Vlag om te voorkomen dat loadHealth elke seconde loopt
 
 async function loadHealth() {
   if (healthLoaded) return; // Alleen bij eerste keer laden
@@ -4362,6 +4650,8 @@ function tick() {
     loadManualTrades();
   } else if (activeTab === "backtest") {
     loadBacktest();
+  } else if (activeTab === "news") {
+    loadNews();
   } else if (activeTab === "stars") {
     loadStars();
   } else if (activeTab === "forecast") {
@@ -4646,11 +4936,7 @@ async fn run_orderbook_worker(
 // NIEUW: Priority Pair Scanner
 // ============================================================================
 
-async fn run_priority_pair_scanner(
-    engine: Engine,
-    config: Arc<Mutex<AppConfig>>,
-    key_to_norm: HashMap<String, String>,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_priority_pair_scanner(engine: Engine, config: Arc<Mutex<AppConfig>>) -> Result<(), Box<dyn std::error::Error>> {
     println!("[PRIORITY SCANNER] Started, checking every 5 seconds");
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -4680,7 +4966,7 @@ async fn run_priority_pair_scanner(
 
                             if last > 0.0 && open > 0.0 {
                                 let ts_int = Utc::now().timestamp();
-                                let norm = key_to_norm.get(k).cloned().unwrap_or_else(|| k.clone());
+                                let norm = normalize_pair(k);
                                 engine.handle_ticker(&norm, last, vol24h, open, ts_int);
                                 println!("[PRIORITY] Updated {} at ts {}", norm, ts_int);
                             }
@@ -4750,6 +5036,88 @@ async fn run_anomaly_scanner(
 
         sleep(Duration::from_secs(20)).await;
     }
+}
+
+// ============================================================================
+// HOOFDSTUK 16 – NIEUWS-SENTIMENT SCANNER (NIEUW STAP)
+// ============================================================================
+
+// NIEUW: run_news_scanner functie (stap 2)
+async fn run_news_scanner(engine: Engine) -> Result<(), Box<dyn std::error::Error>> {
+    println!("Starting news sentiment scanner...");
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+
+    let mut processed_titles: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    loop {
+        // Voorbeeld: RSS feed van een crypto nieuws site (bijv. CoinTelegraph)
+        let rss_url = "https://cointelegraph.com/rss";
+
+        if let Ok(resp) = client.get(rss_url).send().await {
+            if let Ok(content) = resp.text().await {
+                if let Ok(channel) = Channel::read_from(Cursor::new(content.as_bytes())) {
+                    for item in channel.items {
+                        if let Some(title) = item.title {
+                            // Check if we've already processed this title
+                            if processed_titles.contains(&title) {
+                                continue; // Skip already processed articles
+                            }
+
+                            // Mark as processed
+                            processed_titles.insert(title.clone());
+
+                            // Eenvoudige sentiment analyse: tel positieve/negatieve woorden
+                            let positive_words = SENTIMENT_MAP.get("positive").cloned().unwrap_or_default();
+                            let negative_words = SENTIMENT_MAP.get("negative").cloned().unwrap_or_default();
+
+                            let title_lower = title.to_lowercase();
+                            let mut pos_score = 0.0;
+                            let mut neg_score = 0.0;
+                            for (word, weight) in &positive_words {
+                                pos_score += title_lower.matches(word).count() as f64 * *weight as f64;
+                            }
+                            for (word, weight) in &negative_words {
+                                neg_score += title_lower.matches(word).count() as f64 * *weight as f64;
+                            }
+                            let sentiment = if pos_score + neg_score > 0.0 {
+                                pos_score / (pos_score + neg_score)
+                            } else {
+                                0.5
+                            };
+
+                            // Extract pair van title (bijv. "BTC" of "Bitcoin") - FIX: Alleen updaten als pair gevonden
+                            if let Some(pair) = extract_pair_from_title(&title) {
+                                engine.update_sentiment(&pair, sentiment, &title);
+                                println!("[NEWS] {} sentiment {:.2} for {}", title, sentiment, pair);
+                            } else {
+                                // FIX: Geen fallback naar BTC/EUR, skip artikel
+                                println!("[NEWS SKIP] {} - no matching pair", title);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Wacht 1 uur voor volgende scan (veranderd van 60s)
+        sleep(Duration::from_secs(3600)).await;
+    }
+}
+
+// NIEUW: Helper functie om pair uit title te extraheren
+fn extract_pair_from_title(title: &str) -> Option<String> {
+    let title_lower = title.to_lowercase();
+
+    // Use pre-sorted keywords to check more specific keywords first
+    for (keyword, pair) in SORTED_KEYWORDS.iter() {
+        if title_lower.contains(keyword) {
+            return Some(pair.clone());
+        }
+    }
+    None
 }
 
 // ============================================================================
@@ -5009,6 +5377,28 @@ async fn run_http(engine: Engine, config: Arc<Mutex<AppConfig>>) {
             warp::reply::json(&serde_json::json!({"status": "reset"}))
         });
 
+    // NIEUW: API voor nieuws-sentiment (stap 4)
+    let api_news = warp::path!("api" / "news")
+        .and(engine_filter.clone())
+        .map(|engine: Engine| {
+            let mut news_data = Vec::new();
+            for ns in engine.news_sentiment.iter() {
+                let pair = ns.key().clone();
+                let value = ns.value();
+                let sentiment = value.0;
+                let last_update = value.1;
+                let title = value.2.clone();
+                news_data.push(serde_json::json!({
+                    "pair": pair,
+                    "sentiment": sentiment,
+                    "last_update": last_update,
+                    "articles": title
+                }));
+            }
+            warp::reply::json(&news_data)
+        });
+
+    // NIEUW: API voor stars historie
     let api_stars_history = warp::path!("api" / "stars_history")
         .and(engine_filter.clone())
         .map(|engine: Engine| {
@@ -5018,10 +5408,12 @@ async fn run_http(engine: Engine, config: Arc<Mutex<AppConfig>>) {
             warp::reply::json(&sorted_history)
         });
 
+    // NIEUW: API voor forecast voorspellingen
     let api_forecast = warp::path!("api" / "forecast")
         .and(engine_filter.clone())
         .map(|engine: Engine| warp::reply::json(&engine.forecast_snapshot()));
 
+    // NIEUW: API voor coin analyse (on-demand)
     let api_coin_analysis = warp::path!("api" / "coin_analysis" / String / String)
         .and_then(|base: String, quote: String| async move {
             let pair = format!("{}/{}", base, quote);
@@ -5072,6 +5464,7 @@ async fn run_http(engine: Engine, config: Arc<Mutex<AppConfig>>) {
             "uptime_seconds": uptime,
             "memory_mb": memory_mb,
             "threads_active": threads_active,
+            "news_scanner_restarts": counts.news_scanner_restarts,
             "ws_worker_restarts": counts.ws_worker_restarts,
             "anomaly_scanner_restarts": counts.anomaly_scanner_restarts,
             "total_restarts": counts.total_restarts
@@ -5128,6 +5521,7 @@ async fn run_http(engine: Engine, config: Arc<Mutex<AppConfig>>) {
         .or(api_config_get)
         .or(api_config_post)
         .or(api_config_reset)
+        .or(api_news)
         .or(api_stars_history)
         .or(api_forecast)
         .or(api_coin_analysis)
@@ -5177,6 +5571,16 @@ async fn run_watchdog(engine: Engine) -> Result<(), Box<dyn std::error::Error>> 
         sleep(Duration::from_secs(30)).await; // Check elke 30s
 
         // Altijd herstarten bij crashes (geen limiet meer)
+        {
+            let engine_clone = engine.clone();
+            tokio::spawn(async move {
+                if let Err(e) = run_news_scanner(engine_clone).await {
+                    eprintln!("[WATCHDOG] News scanner restart failed: {:?}", e);
+                }
+            });
+            SELF_HEALING_COUNTS.lock().unwrap().increment_news();
+        }
+
         {
             let engine_clone = engine.clone();
             tokio::spawn(async move {
@@ -5283,9 +5687,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Spawn priority pair scanner
     let engine_priority = engine.clone();
     let config_priority = config.clone();
-    let key_to_norm_priority = key_to_norm.clone();
     tokio::spawn(async move {
-        if let Err(e) = run_priority_pair_scanner(engine_priority, config_priority, key_to_norm_priority).await {
+        if let Err(e) = run_priority_pair_scanner(engine_priority, config_priority).await {
             eprintln!("[PRIORITY SCANNER] Error: {:?}", e);
         }
     });
@@ -5341,6 +5744,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::select! {
             _ = run_cleanup(engine_cleanup) => {},
             _ = rx_cleanup.recv() => println!("Cleanup shutting down"),
+        }
+    });
+
+    let engine_news = engine.clone();
+    let mut rx_news = shutdown_tx.subscribe();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = run_news_scanner(engine_news) => {},
+            _ = rx_news.recv() => println!("News scanner shutting down"),
         }
     });
 
@@ -5459,12 +5871,8 @@ fn denormalize_pair(norm: &str) -> String {
         "DOGE" => "XDGEUR".to_string(),
         "LTC" => "XLTCZEUR".to_string(),
         "ADA" => "ADAEUR".to_string(),
-        "XXBT" => "BTC".to_string(),
-        "XETH" => "ETH".to_string(),
-        "XXRP" => "XRP".to_string(),
-        "XDG" => "DOGE".to_string(),
-        "XXLM" => "XLM".to_string(),
-        s => format!("{}EUR", s),
+        "SOL" => "SOLEUR".to_string(),
+        _ => format!("{}EUR", base),
     }
 }
 
