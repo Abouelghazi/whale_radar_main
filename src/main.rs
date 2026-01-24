@@ -311,6 +311,9 @@ struct TradeState {
     // NIEUW: Counters voor aantal trades per side
     buy_trades: u64,
     sell_trades: u64,
+    // NIEUW: Flow duration tracking
+    current_flow_start: i64,
+    flow_durations: HashMap<String, Vec<i64>>,  // Key: "BUY", "SELL", "NEUTRAL"; Value: Vec of durations in seconds
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -376,6 +379,8 @@ struct Row {
     sell_trades: u64,
     // NIEUW: Time kolom voor Markets tabblad
     ts: i64,
+    // NIEUW: Duration DIR kolom
+    duration_dir: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -403,6 +408,8 @@ struct SignalEvent {
     evaluated: bool,
     ret_5m: Option<f64>,
     eval_horizon_sec: Option<i64>,
+    // NIEUW: Duration DIR kolom
+    duration_dir: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -433,6 +440,8 @@ struct TopRow {
     // NIEUW: Voor Count Trades kolom in Top 10
     buy_trades: u64,
     sell_trades: u64,
+    // NIEUW: Duration DIR kolom
+    duration_dir: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -932,6 +941,24 @@ impl Engine {
         t.last_flow_pct = flow_pct;
         t.last_dir = dir.clone();
 
+        // NIEUW: Detect flow change and record duration
+        if t.current_flow_start == 0 {
+            t.current_flow_start = ts_int;
+        } else if t.last_dir != dir {
+            // Flow changed, record duration
+            let duration = ts_int - t.current_flow_start;
+            if duration > 0 {
+                t.flow_durations.entry(t.last_dir.clone()).or_insert_with(Vec::new).push(duration);
+                // Keep only last 100 durations to save memory
+                if let Some(durs) = t.flow_durations.get_mut(&t.last_dir) {
+                    if durs.len() > 100 {
+                        durs.remove(0);
+                    }
+                }
+            }
+            t.current_flow_start = ts_int;
+        }
+
         let cutoff5 = ts - 300.0;
         if side == "b" {
             t.recent_buys_5m.push((ts, volume));
@@ -1279,6 +1306,7 @@ impl Engine {
                 let whale_side = t.last_whale_side.clone().unwrap_or_else(|| "-".to_string());
                 let whale_volume = t.last_whale_volume.unwrap_or(0.0);
                 let whale_notional = t.last_whale_notional.unwrap_or(0.0);
+                let duration_dir = compute_flow_durations(&t).get(&dir).copied().unwrap_or(0.0) / 60.0;
                 let row = TopRow {
                     ts: ts_int,
                     pair: pair.to_string(),
@@ -1324,6 +1352,7 @@ impl Engine {
                         buy_trades: t.buy_trades, 
                         sell_trades: t.sell_trades, 
                         ts: ts_int, // NIEUW: ts veld toegevoegd
+                        duration_dir,
                     }),
                     whale_pred_score,
                     whale_pred_label: whale_pred_label.clone(),
@@ -1360,6 +1389,7 @@ impl Engine {
                         buy_trades: t.buy_trades, 
                         sell_trades: t.sell_trades, 
                         ts: ts_int, // NIEUW: ts veld toegevoegd
+                        duration_dir,
                     }, t.trade_count as usize, compute_reliability(&t, ts_int).0),
                     momentum: compute_momentum(pct, pump_score, flow_pct),
                     trade_score: compute_trade_score(
@@ -1394,6 +1424,7 @@ impl Engine {
                             buy_trades: t.buy_trades, 
                             sell_trades: t.sell_trades, 
                             ts: ts_int, // NIEUW: ts veld toegevoegd
+                            duration_dir,
                         }, t.trade_count as usize, compute_reliability(&t, ts_int).0),
                         compute_reliability(&t, ts_int).0,
                         whale_pred_score,
@@ -1403,6 +1434,7 @@ impl Engine {
                     ),
                     buy_trades: t.buy_trades,
                     sell_trades: t.sell_trades,
+                    duration_dir,
                 };
                 self.add_to_stars_history(row);
             } else {
@@ -1411,6 +1443,7 @@ impl Engine {
         }
 
         if whale_pred_label == "HIGH" && prev_pred_label != "HIGH" {
+            let duration_dir = compute_flow_durations(&t).get(&dir).copied().unwrap_or(0.0) / 60.0;
             let ev = SignalEvent {
                 ts: ts_int,
                 pair: pair.to_string(),
@@ -1435,11 +1468,13 @@ impl Engine {
                 evaluated: false,
                 ret_5m: None,
                 eval_horizon_sec: None,
+                duration_dir,
             };
             self.push_signal(ev);
         }
 
         if pump_label != "NONE" && pump_label != prev_pump_sig {
+            let duration_dir = compute_flow_durations(&t).get(&dir).copied().unwrap_or(0.0) / 60.0;
             let ev = SignalEvent {
                 ts: ts_int,
                 pair: pair.to_string(),
@@ -1464,11 +1499,13 @@ impl Engine {
                 evaluated: false,
                 ret_5m: None,
                 eval_horizon_sec: None,
+                duration_dir,
             };
             self.push_signal(ev);
         }
 
         if is_whale && !prev_whale {
+            let duration_dir = compute_flow_durations(&t).get(&dir).copied().unwrap_or(0.0) / 60.0;
             let ev = SignalEvent {
                 ts: ts_int,
                 pair: pair.to_string(),
@@ -1497,11 +1534,13 @@ impl Engine {
                 evaluated: false,
                 ret_5m: None,
                 eval_horizon_sec: None,
+                duration_dir,
             };
             self.push_signal(ev);
         }
 
         if new_early != "NONE" && new_early != prev_early {
+            let duration_dir = compute_flow_durations(&t).get(&dir).copied().unwrap_or(0.0) / 60.0;
             let ev = SignalEvent {
                 ts: ts_int,
                 pair: pair.to_string(),
@@ -1526,11 +1565,13 @@ impl Engine {
                 evaluated: false,
                 ret_5m: None,
                 eval_horizon_sec: None,
+                duration_dir,
             };
             self.push_signal(ev);
         }
 
         if new_alpha != "NONE" && new_alpha != prev_alpha {
+            let duration_dir = compute_flow_durations(&t).get(&dir).copied().unwrap_or(0.0) / 60.0;
             let ev = SignalEvent {
                 ts: ts_int,
                 pair: pair.to_string(),
@@ -1555,6 +1596,7 @@ impl Engine {
                 evaluated: false,
                 ret_5m: None,
                 eval_horizon_sec: None,
+                duration_dir,
             };
             self.push_signal(ev);
         }
@@ -1663,6 +1705,7 @@ impl Engine {
                 let whale_pred_label = t.whale_pred_label.clone().unwrap_or_else(|| "NONE".to_string());
                 let reliability_score = compute_reliability(&t, ts_int).0;
                 let reliability_label = compute_reliability(&t, ts_int).1;
+                let duration_dir = compute_flow_durations(&t).get(&dir).copied().unwrap_or(0.0) / 60.0;
                 let row = TopRow {
                     ts: ts_int,
                     pair: pair.to_string(),
@@ -1708,6 +1751,7 @@ impl Engine {
                         buy_trades: t.buy_trades, 
                         sell_trades: t.sell_trades, 
                         ts: ts_int, // NIEUW: ts veld toegevoegd
+                        duration_dir,
                     }),
                     whale_pred_score,
                     whale_pred_label: whale_pred_label.clone(),
@@ -1744,6 +1788,7 @@ impl Engine {
                         buy_trades: t.buy_trades, 
                         sell_trades: t.sell_trades, 
                         ts: ts_int, // NIEUW: ts veld toegevoegd
+                        duration_dir,
                     }, t.trade_count as usize, compute_reliability(&t, ts_int).0),
                     momentum: compute_momentum(pct, pump_score, t.last_flow_pct),
                     trade_score: compute_trade_score(
@@ -1778,6 +1823,7 @@ impl Engine {
                             buy_trades: t.buy_trades, 
                             sell_trades: t.sell_trades, 
                             ts: ts_int, // NIEUW: ts veld toegevoegd
+                            duration_dir,
                         }, t.trade_count as usize, compute_reliability(&t, ts_int).0),
                         compute_reliability(&t, ts_int).0,
                         whale_pred_score,
@@ -1787,10 +1833,12 @@ impl Engine {
                     ),
                     buy_trades: t.buy_trades,
                     sell_trades: t.sell_trades,
+                    duration_dir,
                 };
                 self.add_to_stars_history(row);
             }
 
+            let duration_dir = compute_flow_durations(&t).get(&dir).copied().unwrap_or(0.0) / 60.0;
             let ev = SignalEvent {
                 ts: ts_int,
                 pair: pair.to_string(),
@@ -1815,6 +1863,7 @@ impl Engine {
                 evaluated: true,
                 ret_5m: None,
                 eval_horizon_sec: None,
+                duration_dir,
             };
             self.push_signal(ev);
         }
@@ -1885,6 +1934,8 @@ impl Engine {
 
             let (reliability_score, reliability_label) = compute_reliability(&v, now_ts);
 
+            let duration_dir = compute_flow_durations(&v).get(&dir).copied().unwrap_or(0.0) / 60.0;
+
             rows.push(Row {
                 pair: pair.clone(),
                 price: cl,
@@ -1918,6 +1969,7 @@ impl Engine {
                 buy_trades: v.buy_trades,
                 sell_trades: v.sell_trades,
                 ts: v.last_update_ts, // NIEUW: ts veld toegevoegd voor Time kolom in Markets
+                duration_dir,
             });
         }
 
@@ -2158,6 +2210,7 @@ impl Engine {
                     ),
                     buy_trades: r.buy_trades,
                     sell_trades: r.sell_trades,
+                    duration_dir: r.duration_dir, // NIEUW: duration_dir veld gebruikt
                 }
             })
             .collect();
@@ -2243,6 +2296,7 @@ impl Engine {
                     ),
                     buy_trades: r.buy_trades,
                     sell_trades: r.sell_trades,
+                    duration_dir: r.duration_dir, // NIEUW: duration_dir veld gebruikt
                 }
             })
             .collect();
@@ -2535,6 +2589,19 @@ fn compute_reliability(t: &TradeState, now_ts: i64) -> (f64, String) {
     (score, label)
 }
 
+// NIEUW: Functie om flow durations te berekenen
+fn compute_flow_durations(t: &TradeState) -> HashMap<String, f64> {
+    let mut avgs = HashMap::new();
+    for (dir, durs) in &t.flow_durations {
+        if !durs.is_empty() {
+            let sum: i64 = durs.iter().sum();
+            let avg = sum as f64 / durs.len() as f64;
+            avgs.insert(dir.clone(), avg);
+        }
+    }
+    avgs
+}
+
 // ============================================================================
 // HOOFDSTUK 8 – NORMALISATIE (ASSETS & PAIRS)
 // ============================================================================
@@ -2708,7 +2775,7 @@ tr:nth-child(even){ background:#252525; }
           <th>Flow</th><th>Dir</th><th>Early</th><th>Alpha</th><th>Pump</th>
           <th>WhPred</th><th>Rel</th><th>Total score</th><th>Trades</th><th>Buys</th><th>Sells</th>
           <th>O</th><th>H</th><th>L</th><th>C</th>
-          <th>Visual</th>
+          <th>Duration DIR</th><th>Visual</th>
         </tr>
       </thead>
       <tbody></tbody>
@@ -2732,7 +2799,7 @@ tr:nth-child(even){ background:#252525; }
           <th>Time (ts)</th><th>Pair</th><th>Type</th><th>Dir</th>
           <th>Strength</th><th>Flow</th><th>%</th><th>Total score</th>
           <th>Whale</th><th>Vol</th><th>Notional</th><th>Price</th><th>Pump</th>
-          <th>Visual</th>
+          <th>Duration DIR</th><th>Visual</th>
         </tr>
       </thead>
       <tbody></tbody>
@@ -2756,7 +2823,7 @@ tr:nth-child(even){ background:#252525; }
         <tr>
           <th>Time</th><th>Pair</th><th>Price</th><th>%</th><th>Flow</th><th>Dir</th>
           <th>Early</th><th>Alpha</th><th>Whale</th><th>Pump</th>
-          <th>WhPred</th><th>Rel</th><th>Type</th><th>Confidence</th><th>Momentum</th><th>Trade Score</th><th>Count Trades</th><th>Visual</th><th>Analyse</th>
+          <th>WhPred</th><th>Rel</th><th>Type</th><th>Confidence</th><th>Momentum</th><th>Trade Score</th><th>Count Trades</th><th>Duration DIR</th><th>Visual</th><th>Analyse</th>
         </tr>
       </thead>
       <tbody></tbody>
@@ -2768,7 +2835,7 @@ tr:nth-child(even){ background:#252525; }
         <tr>
           <th>Time</th><th>Pair</th><th>Price</th><th>%</th><th>Flow</th><th>Dir</th>
           <th>Early</th><th>Alpha</th><th>Whale</th><th>Pump</th>
-          <th>WhPred</th><th>Rel</th><th>Type</th><th>Confidence</th><th>Momentum</th><th>Trade Score</th><th>Count Trades</th><th>Visual</th><th>Analyse</th>
+          <th>WhPred</th><th>Rel</th><th>Type</th><th>Confidence</th><th>Momentum</th><th>Trade Score</th><th>Count Trades</th><th>Duration DIR</th><th>Visual</th><th>Analyse</th>
         </tr>
       </thead>
       <tbody></tbody>
@@ -2780,7 +2847,7 @@ tr:nth-child(even){ background:#252525; }
         <tr>
           <th>Time</th><th>Pair</th><th>Price</th><th>%</th><th>Flow</th><th>Dir</th>
           <th>Early</th><th>Alpha</th><th>Whale</th><th>Pump</th>
-          <th>Rel</th><th>Type</th><th>Confidence</th><th>Momentum</th><th>Trade Score</th><th>Count Trades</th><th>Visual</th><th>Analyse</th>
+          <th>Rel</th><th>Type</th><th>Confidence</th><th>Momentum</th><th>Trade Score</th><th>Count Trades</th><th>Duration DIR</th><th>Visual</th><th>Analyse</th>
         </tr>
       </thead>
       <tbody></tbody>
@@ -2937,7 +3004,7 @@ tr:nth-child(even){ background:#252525; }
         <tr>
           <th>Time</th><th>Pair</th><th>Price</th><th>%</th><th>Flow</th><th>Dir</th>
           <th>Early</th><th>Alpha</th><th>Whale</th><th>Pump</th>
-          <th>WhPred</th><th>Rel</th><th>Type</th><th>Confidence</th><th>Momentum</th><th>Trade Score</th><th>Count Trades</th><th>Visual</th><th>Analyse</th>
+          <th>WhPred</th><th>Rel</th><th>Type</th><th>Confidence</th><th>Momentum</th><th>Trade Score</th><th>Count Trades</th><th>Duration DIR</th><th>Visual</th><th>Analyse</th>
         </tr>
       </thead>
       <tbody></tbody>
@@ -2948,7 +3015,7 @@ tr:nth-child(even){ background:#252525; }
         <tr>
           <th>Time</th><th>Pair</th><th>Price</th><th>%</th><th>Flow</th><th>Dir</th>
           <th>Early</th><th>Alpha</th><th>Whale</th><th>Pump</th>
-          <th>WhPred</th><th>Rel</th><th>Type</th><th>Confidence</th><th>Momentum</th><th>Trade Score</th><th>Count Trades</th><th>Visual</th><th>Analyse</th>
+          <th>WhPred</th><th>Rel</th><th>Type</th><th>Confidence</th><th>Momentum</th><th>Trade Score</th><th>Count Trades</th><th>Duration DIR</th><th>Visual</th><th>Analyse</th>
         </tr>
       </thead>
       <tbody></tbody>
@@ -3084,6 +3151,7 @@ tr:nth-child(even){ background:#252525; }
         <li><b>Momentum</b>: koopmoment score (0-100%) gebaseerd op %, Pump en Flow.</li>
         <li><b>Trade Score</b>: holistische beslissingscore (0-100%) voor koop/vermijd, met risico-penaliteiten.</li>
         <li><b>Count Trades</b>: aantal Buy en Sell trades, geformatteerd als "100_Buy / 30_Sell".</li>
+        <li><b>Duration DIR</b>: gemiddelde duur van de huidige flow richting in minuten.</li>
         <li><b>Visual</b>: link naar de bijbehorende Kraken Pro grafiek.</li>
       </ul>
     </div>
@@ -3288,6 +3356,7 @@ async function loadMarkets() {
       <td>${r.h.toFixed(4)}</td>
       <td>${r.l.toFixed(4)}</td>
       <td>${r.c.toFixed(4)}</td>
+      <td>${r.duration_dir.toFixed(1)} min</td>
       <td>${visual}</td>
     </tr>`;
 
@@ -3351,6 +3420,7 @@ async function loadSignals() {
       <td>${(r.notional/1000).toFixed(1)}k</td>
       <td>${r.price.toFixed(4)}</td>
       <td style="color:${pumpColor}">${pumpText}</td>
+      <td>${r.duration_dir.toFixed(1)} min</td>
       <td>${visual}</td>
     </tr>`;
 
@@ -3422,6 +3492,7 @@ async function loadTop10() {
         <td>${r.momentum.toFixed(1)}%</td>
         <td>${r.trade_score.toFixed(1)}</td>
         <td>${countTradesText}</td>
+        <td>${r.duration_dir.toFixed(1)} min</td>
         <td>${visual}</td>
         <td>${r.analysis}</td>
       </tr>`;
@@ -3451,6 +3522,7 @@ async function loadTop10() {
         <td>${r.momentum.toFixed(1)}%</td>
         <td>${r.trade_score.toFixed(1)}</td>
         <td>${countTradesText}</td>
+        <td>${r.duration_dir.toFixed(1)} min</td>
         <td>${visual}</td>
         <td>${r.analysis}</td>
       </tr>`;
@@ -4034,6 +4106,7 @@ async function loadStars() {
               <td>${r.momentum.toFixed(1)}%</td>
               <td>${r.trade_score.toFixed(1)}</td>
               <td>${r.buy_trades}_Buy / ${r.sell_trades}_Sell</td>
+              <td>${r.duration_dir.toFixed(1)} min</td>
               <td>${visual}</td>
               <td>${r.analysis}</td>
             </tr>`;
@@ -4573,7 +4646,11 @@ async fn run_orderbook_worker(
 // NIEUW: Priority Pair Scanner
 // ============================================================================
 
-async fn run_priority_pair_scanner(engine: Engine, config: Arc<Mutex<AppConfig>>) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_priority_pair_scanner(
+    engine: Engine,
+    config: Arc<Mutex<AppConfig>>,
+    key_to_norm: HashMap<String, String>,
+) -> Result<(), Box<dyn std::error::Error>> {
     println!("[PRIORITY SCANNER] Started, checking every 5 seconds");
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -4603,7 +4680,7 @@ async fn run_priority_pair_scanner(engine: Engine, config: Arc<Mutex<AppConfig>>
 
                             if last > 0.0 && open > 0.0 {
                                 let ts_int = Utc::now().timestamp();
-                                let norm = normalize_pair(k);
+                                let norm = key_to_norm.get(k).cloned().unwrap_or_else(|| k.clone());
                                 engine.handle_ticker(&norm, last, vol24h, open, ts_int);
                                 println!("[PRIORITY] Updated {} at ts {}", norm, ts_int);
                             }
@@ -5206,8 +5283,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Spawn priority pair scanner
     let engine_priority = engine.clone();
     let config_priority = config.clone();
+    let key_to_norm_priority = key_to_norm.clone();
     tokio::spawn(async move {
-        if let Err(e) = run_priority_pair_scanner(engine_priority, config_priority).await {
+        if let Err(e) = run_priority_pair_scanner(engine_priority, config_priority, key_to_norm_priority).await {
             eprintln!("[PRIORITY SCANNER] Error: {:?}", e);
         }
     });
