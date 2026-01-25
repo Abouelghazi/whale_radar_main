@@ -1849,9 +1849,9 @@ impl Engine {
                             buy_trades: t.buy_trades, 
                             sell_trades: t.sell_trades, 
                             ts: ts_int, // NIEUW: ts veld toegevoegd
-                            avg_buy_duration_sec: 0.0,
-                            avg_sell_duration_sec: 0.0,
-                            avg_neutral_duration_sec: 0.0,
+                        avg_buy_duration_sec: 0.0,
+                        avg_sell_duration_sec: 0.0,
+                        avg_neutral_duration_sec: 0.0,
                     }, t.trade_count as usize, Self::compute_reliability(&t, ts_int).0),
                         Self::compute_reliability(&t, ts_int).0,
                         whale_pred_score,
@@ -4903,7 +4903,7 @@ async fn run_cleanup(engine: Engine) {
             t.dir_history.retain(|(ts, _)| *ts >= cutoff_dir);
         }
 
-        println!("Cleanup: oude trades (>12u), candles (>24u), orderbooks (>1m), signals (>24u) en dir_history (>24u) opgeschoond, oude ANOM flags gereset.");
+        println!("Cleanup: oude trades (>12u), candles (>24u), orderbooks (>1m) en dir_history (>24u) opgeschoond, oude ANOM flags gereset.");
     }
 }
 
@@ -5191,19 +5191,23 @@ async fn run_http(engine: Engine, config: Arc<Mutex<AppConfig>>) {
 // ============================================================================
 
 async fn run_watchdog(engine: Engine) -> Result<(), Box<dyn std::error::Error>> {
-    println!("[WATCHDOG] Started self-healing watchdog...");
+    println!("[WATCHDOG] Started self-healing watchdog (monitoring only)...");
     loop {
-        sleep(Duration::from_secs(30)).await; // Check elke 30s
-
-        // News scanner is verwijderd, dus alleen WS en anomaly herstarten
+        sleep(Duration::from_secs(30)).await;
+        // Alleen monitoren en counters bijwerken – geen nieuwe taken
         {
-            let engine_clone = engine.clone();
-            tokio::spawn(async move {
-                if let Err(e) = run_anomaly_scanner(engine_clone, vec![], HashMap::new()).await {
-                    eprintln!("[WATCHDOG] Anomaly scanner restart failed: {:?}", e);
-                }
-            });
-            SELF_HEALING_COUNTS.lock().unwrap().increment_anomaly();
+            let mut counts = SELF_HEALING_COUNTS.lock().unwrap();
+            // Bijv. check of WS workers nog leven (optioneel, zonder spawn)
+            // counts.increment_anomaly(); // Alleen als nodig, niet elke iteratie
+            println!("[WATCHDOG] Monitoring: {} total restarts", counts.total_restarts);
+        }
+        // Optionele verbetering voor betrouwbaarheid: Health check via shared flag in Engine
+        let engine_clone = engine.clone();
+        // Controleer of anomaly scanner nog loopt (via een flag in Engine, indien toegevoegd)
+        // Bijv. als flag false is, log warning en verhoog counter
+        // Voor nu: alleen logging
+        if engine_clone.signals.lock().unwrap().len() > 1000 {
+            eprintln!("[WATCHDOG] Warning: Signals buffer >1000, possible overload");
         }
     }
 }
