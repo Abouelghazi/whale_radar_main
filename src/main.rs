@@ -15,12 +15,12 @@
 //     6.3 Analyse & snapshots
 //  7. Betrouwbaarheid & kwaliteitsscores
 //  8. Normalisatie (assets & pairs)
-//  9. Frontend (HTML dashboard) – Aangepast voor Confidence + Momentum + Trade Score + Health Tab + Status Kolom + Count Trades Kolom + Forecast Tabblad + Priority Pair Selectie in Health Tab + Tim[...]
+//  9. Frontend (HTML dashboard) – Aangepast voor Confidence + Momentum + Trade Score + Health Tab + Status Kolom + Count Trades Kolom + Forecast Tabblad + Priority Pair Selectie in Health Tab + Risk Classification in Signals Tab
 // 10. WebSocket workers
 // 11. REST anomaly scanner
 // 12. Self-evaluator (zelflerend)
 // 13. Cleanup & onderhoud (agressiever gemaakt)
-//  14. HTTP server & API (met health endpoint uitgebreid met echte metrics + Forecast endpoint + Priority Pair API)
+//  14. HTTP server & API (met health endpoint uitgebreid met echte metrics + Forecast endpoint + Priority Pair API + Risk Classification API)
 //  15. Self-healing watchdog (NIEUW, limiet verwijderd)
 // 16. Main entrypoint (met graceful shutdown)
 //
@@ -32,6 +32,7 @@
 // - Priority Pair: Eén geselecteerde pair die frequenter data ophaalt (elke 5s in plaats van 20s) en gehighlight wordt in alle tabbladen.
 // - Time kolom toegevoegd in Markets tabblad.
 // - Search filter toegevoegd in Signals tabblad.
+// - Risk Classification toegevoegd in Signals tabblad met tijd- en kans-factoren.
 // - News functionaliteit VERWIJDERD: Geen KEYWORD_MAP, SENTIMENT_MAP, run_news_scanner, API voor news.
 // ============================================================================
 
@@ -94,11 +95,23 @@ impl SelfHealingCounts {
 }
 
 // ============================================================================
+// NIEUW: Backtest Stats voor historische winrates
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BacktestStats {
+    winrate: f64,
+    total_trades: usize,
+    max_losing_streak: usize,
+}
+
+// ============================================================================
 // LAZY STATIC INITIALIZATION
 // ============================================================================
 
 lazy_static! {
     static ref START_TIME: i64 = Utc::now().timestamp(); // Voor uptime tracking
+    static ref BACKTEST_STATS: Arc<Mutex<HashMap<(String, String), BacktestStats>>> = Arc::new(Mutex::new(HashMap::new()));
 }
 
 async fn load_config() -> AppConfig {
@@ -356,7 +369,7 @@ impl TradeState {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct CandleState {
     open: Option<f64>,
     high: Option<f64>,
@@ -450,9 +463,19 @@ struct SignalEvent {
     evaluated: bool,
     ret_5m: Option<f64>,
     eval_horizon_sec: Option<i64>,
+    // NIEUW: Uitgebreide risk classificatie met tijd en kans
+    risk_score: f64,
+    risk_label: String,
+    risk_time: f64,
+    risk_probability: f64,
+    risk_market: f64,
+    risk_data: f64,
+    signal_age_min: i64,
+    success_probability: f64,
+    historical_winrate: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 struct TopRow {
     ts: i64,
     pair: String,
@@ -605,6 +628,314 @@ fn compute_trade_score(
     }
     
     score.max(0.0).min(100.0)
+}
+
+// ============================================================================
+// NIEUWE FUNCTIES: Risk Classification met Tijd en Kans Factoren
+// ============================================================================
+
+fn calculate_time_risk(signal_ts: i64, now_ts: i64) -> f64 {
+    let age_sec = now_ts - signal_ts;
+    let age_min = age_sec / 60;
+    
+    // Hoe ouder het signaal, hoe meer risico (opportunity window sluit)
+    if age_min > 15 {
+        return 20.0;  // >15 min = stale signal, momentum weg
+    } else if age_min > 10 {
+        return 15.0;  // 10-15 min = vertraagd, risico neemt toe
+    } else if age_min > 5 {
+        return 10.0;  // 5-10 min = nog geldig maar minder fresh
+    } else {
+        return 0.0;   // 0-5 min = prime window
+    }
+}
+
+fn calculate_momentum_decay_risk(
+    recent_prices: &[(f64, f64)], 
+    pump_score: f64,
+    now_ts: f64
+) -> f64 {
+    if recent_prices.len() < 3 {
+        return 10.0; // Onvoldoende data = risico
+    }
+    
+    // Check of momentum daalt (laatste 3 prijzen)
+    let last_3: Vec<f64> = recent_prices.iter()
+        .rev()
+        .take(3)
+        .map(|(_, p)| *p)
+        .collect();
+    
+    if last_3.len() < 3 {
+        return 10.0;
+    }
+    
+    // Bereken returns tussen opeenvolgende prijzen
+    let ret_1 = (last_3[0] - last_3[1]) / last_3[1]; // Meest recent
+    let ret_2 = (last_3[1] - last_3[2]) / last_3[2]; // Eerder
+    
+    // Als momentum daalt terwijl pump_score hoog is = top warning
+    if pump_score > 6.0 && ret_1 < ret_2 {
+        let decay = ((ret_2 - ret_1) / ret_2.abs()).abs();
+        if decay > 0.5 {
+            return 15.0; // Sterke momentum vertraging
+        } else if decay > 0.2 {
+            return 8.0;  // Lichte vertraging
+        }
+    }
+    
+    0.0
+}
+
+fn calculate_compression_risk(
+    trade_count: u64,
+    last_update_ts: i64,
+    now_ts: i64
+) -> f64 {
+    let time_since_last = now_ts - last_update_ts;
+    
+    // Als veel trades in korte tijd, dan stilte = risico
+    if trade_count > 50 && time_since_last > 120 {
+        return 10.0; // Plotseling stilgevallen na activiteit
+    } else if trade_count > 20 && time_since_last > 180 {
+        return 5.0;  // Afnemende activiteit
+    }
+    
+    0.0
+}
+
+fn calculate_probability_risk(
+    confidence: f64,
+    reliability_score: f64,
+    whale_pred_score: f64,
+    historical_winrate: f64
+) -> f64 {
+    // Gewogen kans op succes (0-100%)
+    let success_prob = (
+        confidence * 0.3 +
+        reliability_score * 0.3 +
+        (whale_pred_score / 10.0 * 100.0) * 0.2 +
+        historical_winrate * 0.2
+    );
+    
+    // Inverseer: lage kans = hoog risico
+    if success_prob < 30.0 {
+        return 25.0;  // <30% kans = zeer hoog risico
+    } else if success_prob < 50.0 {
+        return 15.0;  // 30-50% kans = medium-high risico
+    } else if success_prob < 70.0 {
+        return 8.0;   // 50-70% kans = licht verhoogd risico
+    }
+    
+    0.0  // >70% kans = low risk
+}
+
+fn calculate_mismatch_risk(
+    total_score: f64,
+    confidence: f64,
+    reliability_score: f64
+) -> f64 {
+    // Als total_score hoog maar confidence/reliability laag = false positive risk
+    if total_score > 7.0 {
+        if confidence < 40.0 || reliability_score < 40.0 {
+            return 15.0; // Hoge score met lage zekerheid = red flag
+        } else if confidence < 60.0 || reliability_score < 60.0 {
+            return 8.0;  // Matige mismatch
+        }
+    }
+    
+    0.0
+}
+
+fn calculate_pattern_risk(
+    signal_type: &str,
+    direction: &str,
+    backtest_results: &HashMap<(String, String), BacktestStats>
+) -> f64 {
+    let key = (signal_type.to_string(), direction.to_string());
+    
+    if let Some(stats) = backtest_results.get(&key) {
+        // Check historische performance
+        if stats.winrate < 40.0 {
+            return 10.0;  // Signaaltype faalt vaak historisch
+        } else if stats.winrate < 55.0 {
+            return 5.0;   // Matige historische performance
+        }
+        
+        // Check max losing streak
+        if stats.max_losing_streak > 5 {
+            return 10.0;  // Gevaarlijk patroon
+        }
+    } else {
+        return 8.0;  // Geen historische data = onzekerheid
+    }
+    
+    0.0
+}
+
+fn calculate_volatility_from_prices(prices: &[(f64, f64)]) -> f64 {
+    if prices.len() < 2 {
+        return 0.0;
+    }
+    
+    let price_values: Vec<f64> = prices.iter().map(|(_, p)| *p).collect();
+    let returns: Vec<f64> = price_values.windows(2)
+        .map(|w| ((w[1] - w[0]) / w[0]).abs())
+        .collect();
+    
+    if returns.is_empty() {
+        return 0.0;
+    }
+    
+    let mean = returns.iter().sum::<f64>() / returns.len() as f64;
+    let variance = returns.iter()
+        .map(|r| (r - mean).powi(2))
+        .sum::<f64>() / returns.len() as f64;
+    
+    variance.sqrt() * 100.0 // Als percentage
+}
+
+fn calculate_risk_score_v2(
+    // Bestaande factoren
+    reliability_score: f64,
+    volatility: f64,
+    pump_score: f64,
+    whale_pred_score: f64,
+    recent_anom: bool,
+    flow_pct: f64,
+    
+    // NIEUWE tijd-factoren
+    signal_ts: i64,
+    now_ts: i64,
+    recent_prices: &[(f64, f64)],
+    trade_count: u64,
+    last_update_ts: i64,
+    
+    // NIEUWE kans-factoren
+    confidence: f64,
+    total_score: f64,
+    historical_winrate: f64,
+    signal_type: &str,
+    direction: &str,
+    backtest_results: &HashMap<(String, String), BacktestStats>,
+) -> (f64, String, f64, f64, f64, f64, i64, f64, f64) {
+    let mut risk = 0.0;
+    let mut risk_time = 0.0;
+    let mut risk_probability = 0.0;
+    let mut risk_market = 0.0;
+    let mut risk_data = 0.0;
+    
+    // --- BESTAANDE FACTOREN (max 100 punten) ---
+    // Reliability (0-30) - DATA
+    if reliability_score < 30.0 { 
+        risk += 30.0; 
+        risk_data += 30.0;
+    } else if reliability_score < 60.0 { 
+        risk += 15.0; 
+        risk_data += 15.0;
+    }
+    
+    // Volatility (0-20) - DATA
+    if volatility > 5.0 { 
+        risk += 20.0; 
+        risk_data += 20.0;
+    } else if volatility > 3.0 { 
+        risk += 10.0; 
+        risk_data += 10.0;
+    }
+    
+    // Pump (0-25) - MARKET
+    if pump_score > 8.0 { 
+        risk += 25.0; 
+        risk_market += 25.0;
+    } else if pump_score > 6.0 { 
+        risk += 12.0; 
+        risk_market += 12.0;
+    }
+    
+    // Whale Pred (0-10) - MARKET
+    if whale_pred_score < 3.0 { 
+        risk += 10.0; 
+        risk_market += 10.0;
+    }
+    
+    // Anom + Rel (0-15) - MARKET
+    if recent_anom && reliability_score < 50.0 { 
+        risk += 15.0; 
+        risk_market += 15.0;
+    }
+    
+    // Extreme Flow (0-10) - MARKET
+    if flow_pct > 90.0 || flow_pct < 10.0 { 
+        risk += 10.0; 
+        risk_market += 10.0;
+    }
+    
+    // --- NIEUWE TIJD-FACTOREN (max 45 punten) ---
+    let time_risk = calculate_time_risk(signal_ts, now_ts);
+    risk_time += time_risk;
+    risk += time_risk;
+    
+    let momentum_decay_risk = calculate_momentum_decay_risk(recent_prices, pump_score, now_ts as f64);
+    risk_time += momentum_decay_risk;
+    risk += momentum_decay_risk;
+    
+    let compression_risk = calculate_compression_risk(trade_count, last_update_ts, now_ts);
+    risk_time += compression_risk;
+    risk += compression_risk;
+    
+    // --- NIEUWE KANS-FACTOREN (max 50 punten) ---
+    let probability_risk = calculate_probability_risk(
+        confidence, 
+        reliability_score, 
+        whale_pred_score, 
+        historical_winrate
+    );
+    risk_probability += probability_risk;
+    risk += probability_risk;
+    
+    let mismatch_risk = calculate_mismatch_risk(total_score, confidence, reliability_score);
+    risk_probability += mismatch_risk;
+    risk += mismatch_risk;
+    
+    let pattern_risk = calculate_pattern_risk(signal_type, direction, backtest_results);
+    risk_probability += pattern_risk;
+    risk += pattern_risk;
+    
+    // Cap op 100
+    risk = risk.min(100.0);
+    
+    // Classificatie (aangepast voor hogere max)
+    let risk_label = if risk >= 65.0 {
+        "HIGH"
+    } else if risk >= 35.0 {
+        "MEDIUM"
+    } else {
+        "LOW"
+    }.to_string();
+    
+    // Signal age in minuten
+    let signal_age_min = (now_ts - signal_ts) / 60;
+    
+    // Success probability berekening
+    let success_probability = (
+        confidence * 0.3 +
+        reliability_score * 0.3 +
+        (whale_pred_score / 10.0 * 100.0) * 0.2 +
+        historical_winrate * 0.2
+    ).min(100.0);
+    
+    (
+        risk, 
+        risk_label, 
+        risk_time, 
+        risk_probability, 
+        risk_market, 
+        risk_data,
+        signal_age_min,
+        success_probability,
+        historical_winrate
+    )
 }
 
 // ============================================================================
@@ -1475,6 +1806,65 @@ impl Engine {
             }
         }
 
+        // NIEUW: Risk classificatie berekenen voor signalen
+        let backtest_stats = BACKTEST_STATS.lock().unwrap().clone();
+        let volatility = calculate_volatility_from_prices(&t.recent_prices);
+        let confidence = compute_confidence(&Row { 
+            pair: pair.to_string(), 
+            price, 
+            pct, 
+            whale: is_whale, 
+            whale_side: t.last_whale_side.clone().unwrap_or_else(|| "-".to_string()), 
+            whale_volume: t.last_whale_volume.unwrap_or(0.0), 
+            whale_notional: t.last_whale_notional.unwrap_or(0.0), 
+            flow_pct, 
+            dir: dir.clone(), 
+            early: new_early.clone(), 
+            alpha: new_alpha.clone(), 
+            pump_score, 
+            pump_label: pump_label.clone(), 
+            trades: t.trade_count, 
+            buys: t.buy_volume, 
+            sells: t.sell_volume, 
+            o: c.open.unwrap_or(0.0), 
+            h: c.high.unwrap_or(0.0), 
+            l: c.low.unwrap_or(0.0), 
+            c: c.close.unwrap_or(0.0), 
+            score: total_score, 
+            rating: rating.clone(), 
+            whale_pred_score, 
+            whale_pred_label: whale_pred_label.clone(), 
+            reliability_score: Self::compute_reliability(&t, ts_int).0, 
+            reliability_label: Self::compute_reliability(&t, ts_int).1, 
+            buy_trades: t.buy_trades, 
+            sell_trades: t.sell_trades, 
+            ts: ts_int,
+            avg_buy_duration_sec: 0.0,
+            avg_sell_duration_sec: 0.0,
+            avg_neutral_duration_sec: 0.0,
+        }, t.trade_count as usize, Self::compute_reliability(&t, ts_int).0);
+        let historical_winrate = backtest_stats.get(&(prev_pump_sig.clone(), "BUY".to_string())).map(|s| s.winrate).unwrap_or(50.0);
+        
+        let (risk_score, risk_label, risk_time, risk_probability, risk_market, risk_data, signal_age_min, success_probability, historical_winrate) = calculate_risk_score_v2(
+            Self::compute_reliability(&t, ts_int).0,
+            volatility,
+            pump_score,
+            whale_pred_score,
+            has_recent_anom,
+            flow_pct,
+            ts_int,
+            ts_int,
+            &t.recent_prices,
+            t.trade_count,
+            t.last_update_ts,
+            confidence,
+            total_score,
+            historical_winrate,
+            &prev_pump_sig,
+            "BUY",
+            &backtest_stats,
+        );
+
         if whale_pred_label == "HIGH" && prev_pred_label != "HIGH" {
             let ev = SignalEvent {
                 ts: ts_int,
@@ -1500,6 +1890,16 @@ impl Engine {
                 evaluated: false,
                 ret_5m: None,
                 eval_horizon_sec: None,
+                // NIEUW: Uitgebreide risk classificatie
+                risk_score,
+                risk_label,
+                risk_time,
+                risk_probability,
+                risk_market,
+                risk_data,
+                signal_age_min,
+                success_probability,
+                historical_winrate,
             };
             self.push_signal(ev);
         }
@@ -1529,6 +1929,16 @@ impl Engine {
                 evaluated: false,
                 ret_5m: None,
                 eval_horizon_sec: None,
+                // NIEUW: Uitgebreide risk classificatie
+                risk_score,
+                risk_label,
+                risk_time,
+                risk_probability,
+                risk_market,
+                risk_data,
+                signal_age_min,
+                success_probability,
+                historical_winrate,
             };
             self.push_signal(ev);
         }
@@ -1562,6 +1972,16 @@ impl Engine {
                 evaluated: false,
                 ret_5m: None,
                 eval_horizon_sec: None,
+                // NIEUW: Uitgebreide risk classificatie
+                risk_score,
+                risk_label,
+                risk_time,
+                risk_probability,
+                risk_market,
+                risk_data,
+                signal_age_min,
+                success_probability,
+                historical_winrate,
             };
             self.push_signal(ev);
         }
@@ -1591,6 +2011,16 @@ impl Engine {
                 evaluated: false,
                 ret_5m: None,
                 eval_horizon_sec: None,
+                // NIEUW: Uitgebreide risk classificatie
+                risk_score,
+                risk_label,
+                risk_time,
+                risk_probability,
+                risk_market,
+                risk_data,
+                signal_age_min,
+                success_probability,
+                historical_winrate,
             };
             self.push_signal(ev);
         }
@@ -1620,6 +2050,16 @@ impl Engine {
                 evaluated: false,
                 ret_5m: None,
                 eval_horizon_sec: None,
+                // NIEUW: Uitgebreide risk classificatie
+                risk_score,
+                risk_label,
+                risk_time,
+                risk_probability,
+                risk_market,
+                risk_data,
+                signal_age_min,
+                success_probability,
+                historical_winrate,
             };
             self.push_signal(ev);
         }
@@ -1889,6 +2329,16 @@ impl Engine {
                 evaluated: true,
                 ret_5m: None,
                 eval_horizon_sec: None,
+                // NIEUW: Risk classificatie voor ANOM signalen
+                risk_score: 0.0, // ANOM heeft standaard LOW risk
+                risk_label: "LOW".to_string(),
+                risk_time: 0.0,
+                risk_probability: 0.0,
+                risk_market: 0.0,
+                risk_data: 0.0,
+                signal_age_min: 0,
+                success_probability: 0.0,
+                historical_winrate: 0.0,
             };
             self.push_signal(ev);
         }
@@ -2206,6 +2656,14 @@ impl Engine {
                 0.0
             };
             let expectancy = pnl_sum / n as f64;
+
+            // Update global backtest stats voor risk classificatie
+            let stats = BacktestStats {
+                winrate,
+                total_trades: n,
+                max_losing_streak,
+            };
+            BACKTEST_STATS.lock().unwrap().insert((signal_type.clone(), direction.clone()), stats);
 
             out.push(BacktestResult {
                 signal_type,
@@ -2643,7 +3101,7 @@ fn is_stablecoin(pair: &str) -> bool {
 }
 
 // ============================================================================
-// HOOFDSTUK 9 – FRONTEND (HTML DASHBOARD) – Aangepast voor Priority Pair Selectie in Health Tab + Highlighting in alle tabbladen
+// HOOFDSTUK 9 – FRONTEND (HTML DASHBOARD) – Aangepast voor Risk Classification in Signals Tab + uitgebreide risk info
 // ============================================================================
 
 const DASHBOARD_HTML: &str = r####"<!DOCTYPE html>
@@ -2715,10 +3173,16 @@ tr:nth-child(even){ background:#252525; }
 .rel_med  { color:#cddc39; font-weight:bold; }
 .rel_low  { color:#ff9800; font-weight:bold; }
 .rel_bad  { color:#f44336; font-weight:bold; }
+
+.risk_high { color:#f44336; font-weight:bold; }
+.risk_medium { color:#ff9800; font-weight:bold; }
+.risk_low { color:#4caf50; font-weight:bold; }
+
 .priority-pair {
   background:#333 !important;
   border-left: 5px solid #ff4081;
 }
+
 #coin-analysis-modal {
   display: none;
   position: fixed;
@@ -2799,6 +3263,13 @@ tr:nth-child(even){ background:#252525; }
         <option value="BUY">BUY</option>
         <option value="SELL">SELL</option>
       </select>
+      <label for="signals-risk-filter" style="margin-left:10px;">Risk Level:</label>
+      <select id="signals-risk-filter">
+        <option value="ALL">ALL</option>
+        <option value="LOW">LOW</option>
+        <option value="MEDIUM">MEDIUM</option>
+        <option value="HIGH">HIGH</option>
+      </select>
       <label for="signals-stable-filter" style="margin-left:10px;">Include Stablecoins:</label>
       <input type="checkbox" id="signals-stable-filter" checked />
     </div>
@@ -2808,7 +3279,7 @@ tr:nth-child(even){ background:#252525; }
           <th>Time</th><th>Pair</th><th>Type</th><th>Dir</th>
           <th>Strength</th><th>Flow</th><th>%</th><th>Total score</th>
           <th>Whale</th><th>Vol</th><th>Notional</th><th>Price</th><th>Pump</th>
-          <th>Visual</th>
+          <th>Risk</th><th>Age (min)</th><th>Success %</th><th>Risk Detail</th><th>Visual</th>
         </tr>
       </thead>
       <tbody></tbody>
@@ -3160,6 +3631,9 @@ tr:nth-child(even){ background:#252525; }
         <li><b>Momentum</b>: koopmoment score (0-100%) gebaseerd op %, Pump en Flow.</li>
         <li><b>Trade Score</b>: holistische beslissingscore (0-100%) voor koop/vermijd, met risico-penaliteiten.</li>
         <li><b>Count Trades</b>: aantal Buy en Sell trades, geformatteerd als "100_Buy / 30_Sell".</li>
+        <li><b>Risk</b>: risico classificatie gebaseerd op tijd- en kans-factoren (LOW/MEDIUM/HIGH).</li>
+        <li><b>Age (min)</b>: leeftijd van het signaal in minuten.</li>
+        <li><b>Success %</b>: geschatte kans op succes gebaseerd op historische data.</li>
         <li><b>News Sent.</b>: sentiment van recente nieuwsartikelen (0-1).</li>
         <li><b>Visual</b>: link naar de bijbehorende Kraken Pro grafiek.</li>
       </ul>
@@ -3218,6 +3692,23 @@ function applyDirFilter(tableId, filterSelectId, dirIndex) {
     if (dirCell) {
       const dirText = dirCell.textContent.trim();
       if (filterValue === 'ALL' || dirText === filterValue) {
+        row.style.display = '';
+      } else {
+        row.style.display = 'none';
+      }
+    }
+  });
+}
+
+function applyRiskFilter(tableId, riskFilterId, riskIndex) {
+  const filterValue = document.getElementById(riskFilterId).value;
+  const tbody = document.querySelector(`#${tableId} tbody`);
+  const rows = tbody.querySelectorAll('tr');
+  rows.forEach(row => {
+    const riskCell = row.cells[riskIndex];
+    if (riskCell) {
+      const riskText = riskCell.textContent.trim().split(' ')[0]; // Neem alleen eerste deel (LOW/MEDIUM/HIGH)
+      if (filterValue === 'ALL' || riskText === filterValue) {
         row.style.display = '';
       } else {
         row.style.display = 'none';
@@ -3391,21 +3882,24 @@ function fmtTime(ts) {
 }
 
 async function loadSignals() {
-  let q = document.getElementById("search").value.toLowerCase(); // NIEUW: Search filter toegevoegd
+  let q = document.getElementById("search").value.toLowerCase();
   let includeStable = document.getElementById("signals-stable-filter").checked;
+  let riskFilter = document.getElementById("signals-risk-filter").value;
   let res = await fetch("/api/signals");
   let data = await res.json();
   let tbody = document.querySelector("#signals tbody");
   tbody.innerHTML = "";
 
   let filtered = data.filter(r =>
-    r.pair.toLowerCase().includes(q) && // NIEUW: Filter op pair gebaseerd op search input
-    (includeStable || !isStablecoin(r.pair))
+    r.pair.toLowerCase().includes(q) &&
+    (includeStable || !isStablecoin(r.pair)) &&
+    (riskFilter === "ALL" || r.risk_label === riskFilter)
   );
 
   for (let r of filtered) {
     let typeClass = "signal_type signal_type_" + r.signal_type;
     let dirClass = "signal_dir_" + r.direction;
+    let riskClass = "risk_" + r.risk_label.toLowerCase();
 
     let whaleTxt = r.whale
       ? (r.whale_side.toUpperCase() + " " + r.volume.toFixed(3) +
@@ -3421,6 +3915,8 @@ async function loadSignals() {
     let visualUrl = buildVisualUrl(r.pair);
     let visual = visualUrl ? `<a href="${visualUrl}" target="_blank">Visual</a>` : "-";
 
+    let riskDetail = `Time: ${r.risk_time.toFixed(0)}, Prob: ${r.risk_probability.toFixed(0)}, Market: ${r.risk_market.toFixed(0)}, Data: ${r.risk_data.toFixed(0)}`;
+
     let row = `<tr>
       <td>${fmtTime(r.ts)}</td>
       <td>${r.pair}</td>
@@ -3435,13 +3931,18 @@ async function loadSignals() {
       <td>${(r.notional/1000).toFixed(1)}k</td>
       <td>${r.price.toFixed(4)}</td>
       <td style="color:${pumpColor}">${pumpText}</td>
+      <td class="${riskClass}">${r.risk_label} (${r.risk_score.toFixed(0)})</td>
+      <td>${r.signal_age_min}</td>
+      <td>${r.success_probability.toFixed(0)}%</td>
+      <td title="${riskDetail}">📊</td>
       <td>${visual}</td>
     </tr>`;
 
     tbody.innerHTML += row;
   }
   applyDirFilter('signals', 'signals-dir-filter', 3);
-  highlightPriorityPair('signals', 1); // Pair is in kolom 1
+  applyRiskFilter('signals', 'signals-risk-filter', 13);
+  highlightPriorityPair('signals', 1);
 }
 
 async function loadTop10() {
@@ -3555,7 +4056,7 @@ async function loadTop10() {
   applyDirFilter('top3', 'top10-dir-filter', 5);
   applyDirFilter('top10-up', 'top10-dir-filter', 5);
   applyDirFilter('top10-down', 'top10-dir-filter', 5);
-  highlightPriorityPair('top3', 1); // Pair in kolom 1
+  highlightPriorityPair('top3', 1);
   highlightPriorityPair('top10-up', 1);
   highlightPriorityPair('top10-down', 1);
 }
@@ -3574,7 +4075,7 @@ async function loadForecast() {
       <td>${r.probability.toFixed(0)}%</td><td>${r.duration_min}</td>
     </tr>`;
   }
-  highlightPriorityPair('forecast-table', 1); // Pair in kolom 1
+  highlightPriorityPair('forecast-table', 1);
 }
 
 async function loadManualTrades() {
@@ -3650,7 +4151,7 @@ async function loadManualTrades() {
         <td>${new Date(trade.open_ts * 1000).toLocaleString()}</td>
         <td>${trade.fee_pct.toFixed(2)}%</td>
         <td>€${trade.manual_amount.toFixed(2)}</td>
-        <td>${statusIcon}</td>  <!-- Actuele markt-status per munt -->
+        <td>${statusIcon}</td>
         <td><button onclick="closeManualTrade('${trade.pair}')" style="padding:3px 8px;">Close</button></td>
       </tr>
     `;
@@ -4186,25 +4687,6 @@ async function loadHealth() {
   }
 }
 
-async function loadConfig() {
-  try {
-    let res = await fetch("/api/config");
-    let cfg = await res.json();
-    Object.keys(cfg).forEach(key => {
-      const el = document.getElementById(key);
-      if (el) {
-        if (el.type === 'checkbox') {
-          el.checked = cfg[key];
-        } else {
-          el.value = cfg[key];
-        }
-      }
-    });
-  } catch (e) {
-    console.error("Config load error:", e);
-  }
-}
-
 async function loadPriorityPair() {
   try {
     let configRes = await fetch('/api/config');
@@ -4358,6 +4840,7 @@ window.addEventListener("load", () => {
 // Event listeners voor filters
 document.getElementById('markets-dir-filter').addEventListener('change', () => applyDirFilter('grid', 'markets-dir-filter', 6)); // Adjusted for new Time column
 document.getElementById('signals-dir-filter').addEventListener('change', () => applyDirFilter('signals', 'signals-dir-filter', 3));
+document.getElementById('signals-risk-filter').addEventListener('change', () => applyRiskFilter('signals', 'signals-risk-filter', 13));
 document.getElementById('top10-dir-filter').addEventListener('change', () => {
   applyDirFilter('top3', 'top10-dir-filter', 5);
   applyDirFilter('top10-up', 'top10-dir-filter', 5);
@@ -4960,7 +5443,7 @@ async fn run_aggressive_cleanup(engine: Engine) {
 }
 
 // ============================================================================
-// HOOFDSTUK 14 – HTTP SERVER & API (MET HEALTH ENDPOINT UITGEBREID + FORECAST ENDPOINT + PRIORITY PAIR API)
+// HOOFDSTUK 14 – HTTP SERVER & API (MET HEALTH ENDPOINT UITGEBREID + FORECAST ENDPOINT + PRIORITY PAIR API + RISK CLASSIFICATION API)
 // ============================================================================
 
 
@@ -5213,6 +5696,82 @@ async fn run_watchdog(engine: Engine) -> Result<(), Box<dyn std::error::Error>> 
 }
 
 // ============================================================================
+// NIEUW: Stars History Saver
+// ============================================================================
+
+async fn run_stars_history_saver(engine: Engine) -> Result<(), Box<dyn std::error::Error>> {
+    println!("[STARS SAVER] Started, will save every 10 seconds if dirty");
+    loop {
+        sleep(Duration::from_secs(10)).await;
+        let is_dirty = {
+            let history_guard = engine.stars_history.lock().unwrap();
+            history_guard.dirty
+        };
+        if is_dirty {
+            let data = {
+                let history_guard = engine.stars_history.lock().unwrap();
+                history.history.clone()
+            };
+            match save_stars_history_to_file(&data).await {
+                Ok(_) => {
+                    let mut history_guard = engine.stars_history.lock().unwrap();
+                    history_guard.dirty = false;
+                    println!("[STARS SAVER] Saved successfully, set dirty=false");
+                }
+                Err(e) => eprintln!("[STARS SAVER] Save error: {}", e),
+            }
+        }
+    }
+}
+
+async fn save_stars_history_to_file(data: &[TopRow]) -> Result<(), Box<dyn std::error::Error>> {
+    let json = serde_json::to_string_pretty(data)?;
+    tokio::fs::write(STARS_HISTORY_FILE, json).await?;
+    Ok(())
+}
+
+// ============================================================================
+// NIEUW: Helper functies voor risico berekening
+// ============================================================================
+
+fn calculate_rsi(prices: &[f64]) -> f64 {
+    if prices.len() < 14 { return 50.0; }  // RSI over 14 periodes
+    let mut gains = 0.0;
+    let mut losses = 0.0;
+    for i in 1..14 {
+        let diff = prices[i] - prices[i-1];
+        if diff > 0.0 { gains += diff; } else { losses += diff.abs(); }
+    }
+    let avg_gain = gains / 14.0;
+    let avg_loss = losses / 14.0;
+    if avg_loss == 0.0 { return 100.0; }
+    let rs = avg_gain / avg_loss;
+    100.0 - (100.0 / (1.0 + rs))
+}
+
+fn calculate_volatility(returns: &[f64]) -> f64 {
+    if returns.len() < 2 { return 0.0; }
+    let mean = returns.iter().sum::<f64>() / returns.len() as f64;
+    let variance = returns.iter()
+        .map(|r| (r - mean).powi(2))
+        .sum::<f64>() / returns.len() as f64;
+    variance.sqrt() * 100.0  // Als %
+}
+
+// ============================================================================
+// NIEUW: Coin Analysis Response Struct
+// ============================================================================
+
+#[derive(Debug, Serialize)]
+struct CoinAnalysisResponse {
+    pair: String,
+    current_price: f64,
+    history: Vec<(i64, f64, f64, f64, f64, f64)>,
+    calculations: HashMap<String, f64>,
+    advice: String,
+}
+
+// ============================================================================
 // HOOFDSTUK 16 – MAIN ENTRYPOINT (MET GRACEFUL SHUTDOWN)
 // ============================================================================
 
@@ -5395,37 +5954,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// NIEUW: Automatische saver voor stars historie
-async fn run_stars_history_saver(engine: Engine) -> Result<(), Box<dyn std::error::Error>> {
-    println!("[STARS SAVER] Started, will save every 10 seconds if dirty");
-    loop {
-        sleep(Duration::from_secs(10)).await;
-        let is_dirty = {
-            let history_guard = engine.stars_history.lock().unwrap();
-            history_guard.dirty
-        };
-        if is_dirty {
-            let data = {
-                let history_guard = engine.stars_history.lock().unwrap();
-                history_guard.history.clone()
-            };
-            match save_stars_history_to_file(&data).await {
-                Ok(_) => {
-                    let mut history_guard = engine.stars_history.lock().unwrap();
-                    history_guard.dirty = false;
-                    println!("[STARS SAVER] Saved successfully, set dirty=false");
-                }
-                Err(e) => eprintln!("[STARS SAVER] Save error: {}", e),
-            }
-        }
-    }
-}
-
-async fn save_stars_history_to_file(data: &[TopRow]) -> Result<(), Box<dyn std::error::Error>> {
-    let json = serde_json::to_string_pretty(data)?;
-    tokio::fs::write(STARS_HISTORY_FILE, json).await?;
-    Ok(())
-}
+// ============================================================================
+// NIEUW: Helper voor OHLC fetch
+// ============================================================================
 
 async fn fetch_kraken_ohlc(pair: &str) -> Result<Vec<(i64, f64, f64, f64, f64, f64)>, Box<dyn std::error::Error>> {
     let client = reqwest::Client::new();
@@ -5481,35 +6012,4 @@ fn denormalize_pair(norm: &str) -> String {
         "SOL" => "SOLEUR".to_string(),
         _ => format!("{}EUR", base),
     }
-}
-
-fn calculate_rsi(prices: &[f64]) -> f64 {
-    if prices.len() < 14 { return 50.0; }  // RSI over 14 periodes
-    let mut gains = 0.0;
-    let mut losses = 0.0;
-    for i in 1..14 {
-        let diff = prices[i] - prices[i-1];
-        if diff > 0.0 { gains += diff; } else { losses += diff.abs(); }
-    }
-    let avg_gain = gains / 14.0;
-    let avg_loss = losses / 14.0;
-    if avg_loss == 0.0 { return 100.0; }
-    let rs = avg_gain / avg_loss;
-    100.0 - (100.0 / (1.0 + rs))
-}
-
-fn calculate_volatility(returns: &[f64]) -> f64 {
-    if returns.len() < 2 { return 0.0; }
-    let mean = returns.iter().sum::<f64>() / returns.len() as f64;
-    let variance = returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / returns.len() as f64;
-    variance.sqrt() * 100.0  // Als %
-}
-
-#[derive(Debug, Serialize)]
-struct CoinAnalysisResponse {
-    pair: String,
-    current_price: f64,
-    history: Vec<(i64, f64, f64, f64, f64, f64)>,
-    calculations: HashMap<String, f64>,
-    advice: String,
 }
