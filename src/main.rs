@@ -33,6 +33,10 @@
 // - Time kolom toegevoegd in Markets tabblad.
 // - Search filter toegevoegd in Signals tabblad.
 // - News functionaliteit VERWIJDERD: Geen KEYWORD_MAP, SENTIMENT_MAP, run_news_scanner, API voor news.
+// - NIEUW: High-Rise Logic analyse in Backtest tabblad voor >=5%, >=10%, >=15% stijging binnen 5m.
+// - NIEUW: Signals tabblad Type-filter naast DIR-filter.
+// - NIEUW: High-Rise Logic persistente opslag in lokale JSON + optionele externe endpoint (met skip bij alleen nulwaarden).
+// - NIEUW: High prob kolom in Signals, gebaseerd op high_rise_logic.json (5/10/15%).
 // ============================================================================
 
 use chrono::Utc;
@@ -161,6 +165,9 @@ struct AppConfig {
     ai_max_weight: f64,
     // NIEUW: Eén priority pair voor frequentere data
     priority_pair: Option<String>,
+    // NIEUW: externe opslag voor High-Rise Logic
+    high_rise_store_url: Option<String>,
+    high_rise_store_token: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -201,6 +208,9 @@ impl Default for AppConfig {
             ai_max_weight: 5.0,
             // NIEUW: Geen standaard priority pair
             priority_pair: None,
+            // NIEUW: Externe opslag defaults
+            high_rise_store_url: None,
+            high_rise_store_token: None,
         }
     }
 }
@@ -447,6 +457,12 @@ struct SignalEvent {
     volume_score: f64,
     anomaly_score: f64,
     trend_score: f64,
+    // NIEUW: Metrics voor High-Rise analyse
+    pump_score: f64,
+    whale_pred_score: f64,
+    momentum: f64,
+    #[serde(default)]
+    high_prob_pct: Option<f64>, // NIEUW: 5/10/15% label obv high_rise_logic
     evaluated: bool,
     ret_5m: Option<f64>,
     eval_horizon_sec: Option<i64>,
@@ -498,7 +514,8 @@ struct HeatmapPoint {
     reliability_score: f64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+// FIX: Added Deserialize derive to allow deserializing BacktestResult (required for BacktestResponse)
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct BacktestResult {
     signal_type: String,
     direction: String,
@@ -515,7 +532,29 @@ struct BacktestResult {
     equity_curve: Vec<f64>,
 }
 
+// NIEUW: High-Rise Logic analyse voor >=5%, >=10%, >=15% in 5m
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HighRiseLogic {
+    threshold: f64,
+    occurrences: usize,
+    avg_whale_pred_score: f64,
+    avg_pump_score: f64,
+    avg_flow_pct: f64,
+    avg_momentum: f64,
+    #[serde(default)]
+    updated_at: Option<i64>,
+}
+
+// NIEUW: Backtest response met strategieën + high-rise logica
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BacktestResponse {
+    strategies: Vec<BacktestResult>,
+    high_rise_logic: Vec<HighRiseLogic>,
+}
+
 const STARS_HISTORY_FILE: &str = "stars_history.json";
+// NIEUW: Lokale opslag voor High-Rise Logic
+const HIGH_RISE_FILE: &str = "high_rise_logic.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StarsHistory {
@@ -685,7 +724,7 @@ impl ManualTraderState {
     }
 
     fn add_trade(&mut self, pair: &str, price: f64, sl_pct: f64, tp_pct: f64, fee_pct: f64, manual_amount: f64) -> bool {
-        if self.trades.contains_key(pair) {
+        if self.trades.contains_key(pair) {  // FIX: contains_key i.p.v. containsKey
             return false;
         }
         let size = manual_amount / price;
@@ -795,6 +834,8 @@ struct Engine {
     weights: Arc<Mutex<ScoreWeights>>,
     manual_trader: Arc<Mutex<ManualTraderState>>,
     stars_history: Arc<Mutex<StarsHistory>>,
+    // NIEUW: cache voor high rise logic
+    high_rise_cache: Arc<Mutex<Option<Vec<HighRiseLogic>>>>,
 }
 
 impl Engine {
@@ -809,6 +850,7 @@ impl Engine {
             weights: Arc::new(Mutex::new(ScoreWeights::default())),
             manual_trader: Arc::new(Mutex::new(ManualTraderState::new())),
             stars_history: Arc::new(Mutex::new(StarsHistory { history: Vec::new(), dirty: false })),
+            high_rise_cache: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1475,6 +1517,8 @@ impl Engine {
             }
         }
 
+        let signal_momentum = compute_momentum(pct, pump_score, flow_pct);
+
         if whale_pred_label == "HIGH" && prev_pred_label != "HIGH" {
             let ev = SignalEvent {
                 ts: ts_int,
@@ -1497,6 +1541,10 @@ impl Engine {
                 volume_score,
                 anomaly_score,
                 trend_score,
+                pump_score,
+                whale_pred_score,
+                momentum: signal_momentum,
+                high_prob_pct: None,
                 evaluated: false,
                 ret_5m: None,
                 eval_horizon_sec: None,
@@ -1526,6 +1574,10 @@ impl Engine {
                 volume_score,
                 anomaly_score,
                 trend_score,
+                pump_score,
+                whale_pred_score,
+                momentum: signal_momentum,
+                high_prob_pct: None,
                 evaluated: false,
                 ret_5m: None,
                 eval_horizon_sec: None,
@@ -1559,6 +1611,10 @@ impl Engine {
                 volume_score,
                 anomaly_score,
                 trend_score,
+                pump_score,
+                whale_pred_score,
+                momentum: signal_momentum,
+                high_prob_pct: None,
                 evaluated: false,
                 ret_5m: None,
                 eval_horizon_sec: None,
@@ -1588,6 +1644,10 @@ impl Engine {
                 volume_score,
                 anomaly_score,
                 trend_score,
+                pump_score,
+                whale_pred_score,
+                momentum: signal_momentum,
+                high_prob_pct: None,
                 evaluated: false,
                 ret_5m: None,
                 eval_horizon_sec: None,
@@ -1617,6 +1677,10 @@ impl Engine {
                 volume_score,
                 anomaly_score,
                 trend_score,
+                pump_score,
+                whale_pred_score,
+                momentum: signal_momentum,
+                high_prob_pct: None,
                 evaluated: false,
                 ret_5m: None,
                 eval_horizon_sec: None,
@@ -1865,6 +1929,8 @@ impl Engine {
                 self.add_to_stars_history(row);
             }
 
+            let ev_momentum = compute_momentum(day_ret, t.last_pump_score, t.last_flow_pct);
+
             let ev = SignalEvent {
                 ts: ts_int,
                 pair: pair.to_string(),
@@ -1886,6 +1952,10 @@ impl Engine {
                 volume_score: 0.0,
                 anomaly_score: 0.0,
                 trend_score: 0.0,
+                pump_score: t.last_pump_score,
+                whale_pred_score: t.whale_pred_score,
+                momentum: ev_momentum,
+                high_prob_pct: None,
                 evaluated: true,
                 ret_5m: None,
                 eval_horizon_sec: None,
@@ -2106,10 +2176,75 @@ impl Engine {
     }
 
     fn signals_snapshot(&self) -> Vec<SignalEvent> {
-        let buf = self.signals.lock().unwrap();
+        let mut buf = self.signals.lock().unwrap();
         let mut v: Vec<SignalEvent> = buf.iter().cloned().collect();
+        drop(buf);
+
+        // Laad high rise logic uit cache/bestand
+        let hr_list = self.get_high_rise_logic();
+
+        for ev in v.iter_mut() {
+            // momentum fallback
+            if ev.momentum == 0.0 {
+                ev.momentum = compute_momentum(ev.pct, ev.pump_score, ev.flow_pct);
+            }
+            ev.high_prob_pct = hr_list
+                .as_ref()
+                .and_then(|hrs| Self::calc_high_prob(ev, hrs));
+        }
+
         v.sort_by(|a, b| b.ts.cmp(&a.ts));
         v
+    }
+
+    fn calc_high_prob(ev: &SignalEvent, hrs: &[HighRiseLogic]) -> Option<f64> {
+        // thresholds in desc order
+        let mut sorted = hrs.to_vec();
+        sorted.sort_by(|a, b| b.threshold.partial_cmp(&a.threshold).unwrap());
+
+        for h in sorted.iter() {
+            if h.occurrences == 0 {
+                continue;
+            }
+            let mom = if ev.momentum == 0.0 {
+                compute_momentum(ev.pct, ev.pump_score, ev.flow_pct)
+            } else {
+                ev.momentum
+            };
+            if ev.whale_pred_score >= h.avg_whale_pred_score
+                && ev.pump_score >= h.avg_pump_score
+                && ev.flow_pct >= h.avg_flow_pct
+                && mom >= h.avg_momentum
+            {
+                return Some(h.threshold.min(100.0));
+            }
+        }
+        None
+    }
+
+    fn get_high_rise_logic(&self) -> Option<Vec<HighRiseLogic>> {
+        {
+            let cache = self.high_rise_cache.lock().unwrap();
+            if let Some(v) = &*cache {
+                if highrise_has_nonzero(v) {
+                    return Some(v.clone());
+                }
+            }
+        }
+        // Load from file if cache empty/non-meaningful
+        if let Some(mut loaded) = futures::executor::block_on(load_high_rise_local()) {
+            if highrise_has_nonzero(&loaded) {
+                for h in loaded.iter_mut() {
+                    if h.updated_at.is_none() {
+                        h.updated_at = Some(Utc::now().timestamp());
+                    }
+                }
+                let mut cache = self.high_rise_cache.lock().unwrap();
+                *cache = Some(loaded.clone());
+                return Some(loaded);
+            }
+        }
+        None
     }
 
     fn heatmap_snapshot(&self) -> Vec<HeatmapPoint> {
@@ -2125,11 +2260,16 @@ impl Engine {
             .collect()
     }
 
-    fn backtest_snapshot(&self) -> Vec<BacktestResult> {
-        let sigs = self.signals.lock().unwrap();
+    fn backtest_snapshot(&self) -> BacktestResponse {
+        // Verzamel een snapshot van alle signals om dubbele iteraties op de lock te vermijden
+        let sigs_guard = self.signals.lock().unwrap();
+        let sigs_vec: Vec<SignalEvent> = sigs_guard.iter().cloned().collect();
+        drop(sigs_guard);
+
+        // --- bestaande backtest logica ---
         let mut groups: HashMap<(String, String), Vec<(i64, f64)>> = HashMap::new();
 
-        for ev in sigs.iter() {
+        for ev in sigs_vec.iter() {
             if !ev.evaluated {
                 continue;
             }
@@ -2238,7 +2378,66 @@ impl Engine {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        out
+        // --- High-Rise Logic analyse ---
+        let thresholds = [5.0_f64, 10.0_f64, 15.0_f64];
+        let mut high_rise_logic = Vec::new();
+
+        for th in thresholds {
+            let mut count = 0usize;
+            let mut sum_whale_pred = 0.0;
+            let mut sum_pump = 0.0;
+            let mut sum_flow = 0.0;
+            let mut sum_momentum = 0.0;
+
+            for ev in sigs_vec.iter() {
+                if !ev.evaluated {
+                    continue;
+                }
+                if ev.direction != "BUY" {
+                    continue;
+                }
+                if let Some(ret) = ev.ret_5m {
+                    if ret >= th {
+                        count += 1;
+                        sum_whale_pred += ev.whale_pred_score;
+                        sum_pump += ev.pump_score;
+                        sum_flow += ev.flow_pct;
+                        let momentum_val = if ev.momentum > 0.0 {
+                            ev.momentum
+                        } else {
+                            compute_momentum(ev.pct, ev.pump_score, ev.flow_pct)
+                        };
+                        sum_momentum += momentum_val;
+                    }
+                }
+            }
+
+            let (avg_whale_pred, avg_pump, avg_flow, avg_mom) = if count == 0 {
+                (0.0, 0.0, 0.0, 0.0)
+            } else {
+                (
+                    sum_whale_pred / count as f64,
+                    sum_pump / count as f64,
+                    sum_flow / count as f64,
+                    sum_momentum / count as f64,
+                )
+            };
+
+            high_rise_logic.push(HighRiseLogic {
+                threshold: th,
+                occurrences: count,
+                avg_whale_pred_score: avg_whale_pred,
+                avg_pump_score: avg_pump,
+                avg_flow_pct: avg_flow,
+                avg_momentum: avg_mom,
+                updated_at: Some(Utc::now().timestamp()),
+            });
+        }
+
+        BacktestResponse {
+            strategies: out,
+            high_rise_logic,
+        }
     }
 
     fn manual_trades_snapshot(&self) -> ManualTradesResponse {
@@ -2799,13 +2998,25 @@ tr:nth-child(even){ background:#252525; }
         <option value="BUY">BUY</option>
         <option value="SELL">SELL</option>
       </select>
+      <label for="signals-type-filter" style="margin-left:10px;">Filter op Type:</label>
+      <select id="signals-type-filter">
+        <option value="ALL">ALL</option>
+        <option value="EARLY">EARLY</option>
+        <option value="ALPHA">ALPHA</option>
+        <option value="WHALE">WHALE</option>
+        <option value="ANOM">ANOM</option>
+        <option value="EARLY_PUMP">EARLY_PUMP</option>
+        <option value="MEGA_PUMP">MEGA_PUMP</option>
+        <option value="WH_PRED">WH_PRED</option>
+        <option value="UNCERTAIN">UNCERTAIN</option>
+      </select>
       <label for="signals-stable-filter" style="margin-left:10px;">Include Stablecoins:</label>
       <input type="checkbox" id="signals-stable-filter" checked />
     </div>
     <table id="signals">
       <thead>
         <tr>
-          <th>Time</th><th>Pair</th><th>Type</th><th>Dir</th>
+          <th>Time</th><th>Pair</th><th>High prob</th><th>Type</th><th>Dir</th>
           <th>Strength</th><th>Flow</th><th>%</th><th>Total score</th>
           <th>Whale</th><th>Vol</th><th>Notional</th><th>Price</th><th>Pump</th>
           <th>Visual</th>
@@ -2868,8 +3079,8 @@ tr:nth-child(even){ background:#252525; }
     <table id="forecast-table">
       <thead>
         <tr>
-          <th>Tijd</th><th>Pair</th><th>Trades (Buys/Sells)</th><th>Volume</th><th>Waarde (€)</th>
-          <th>Huidige Prijs (€)</th><th>Doelprijs (€)</th><th>% Stijging/Daling</th>
+          <th>Tijd</th><th>Pair</th><th>% Stijging/Daling</th><th>Trades (Buys/Sells)</th><th>Volume</th><th>Waarde (€)</th>
+          <th>Huidige Prijs (€)</th><th>Doelprijs (€)</th>
           <th>Waarschijnlijkheid (%)</th><th>Duur (min)</th>
         </tr>
       </thead>
@@ -2888,7 +3099,7 @@ tr:nth-child(even){ background:#252525; }
     <h3>Open a Trade</h3>
     <div style="margin-bottom:20px; padding:10px; background:#1a1a1a; border-radius:5px;">
       <label>Pair:</label>
-      <input type="text" id="manual-pair-search" placeholder="Search pair..." style="width:200px; margin-left:5px;" />
+      <input id="manual-pair-search" placeholder="Search pair..." style="width:200px; margin-left:5px;" />
       <select id="manual-pair" style="width:200px; margin-left:10px;">
         <!-- Vul dynamisch met pairs -->
       </select>
@@ -2982,6 +3193,25 @@ tr:nth-child(even){ background:#252525; }
          style="margin-top:4px; font-size:12px; color:#aaa;">
       Klik op een rij om de equity curve van die strategie te zien.
     </div>
+
+    <!-- NIEUW: High-Rise Logic tabel -->
+    <h3 style="margin-top:16px;">High-Rise Logic (>=5%, >=10%, >=15% binnen 5 min)</h3>
+    <p style="font-size:12px;">
+      Gemiddelde waarden van whale_pred_score, pump_score, flow_pct en momentum bij signalen die de genoemde stijging binnen 5 minuten haalden.
+    </p>
+    <table id="highrise-table">
+      <thead>
+        <tr>
+          <th>Drempel (≥ %)</th>
+          <th>Occurrences</th>
+          <th>Gem. WhalePred</th>
+          <th>Gem. Pump</th>
+          <th>Gem. Flow %</th>
+          <th>Gem. Momentum</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
   </div>
 
   <div id="view-heatmap" style="display:none;">
@@ -3393,6 +3623,7 @@ function fmtTime(ts) {
 async function loadSignals() {
   let q = document.getElementById("search").value.toLowerCase(); // NIEUW: Search filter toegevoegd
   let includeStable = document.getElementById("signals-stable-filter").checked;
+  let typeFilter = document.getElementById("signals-type-filter").value;
   let res = await fetch("/api/signals");
   let data = await res.json();
   let tbody = document.querySelector("#signals tbody");
@@ -3400,7 +3631,8 @@ async function loadSignals() {
 
   let filtered = data.filter(r =>
     r.pair.toLowerCase().includes(q) && // NIEUW: Filter op pair gebaseerd op search input
-    (includeStable || !isStablecoin(r.pair))
+    (includeStable || !isStablecoin(r.pair)) &&
+    (typeFilter === 'ALL' || r.signal_type === typeFilter)
   );
 
   for (let r of filtered) {
@@ -3418,12 +3650,17 @@ async function loadSignals() {
     let pumpColor = r.signal_type === "MEGA_PUMP" ? "#ff4081" :
       (r.signal_type === "EARLY_PUMP" ? "#00bcd4" : "#ccc");
 
+    let highProb = r.high_prob_pct !== null && r.high_prob_pct !== undefined
+      ? `${r.high_prob_pct.toFixed(0)}%`
+      : "-";
+
     let visualUrl = buildVisualUrl(r.pair);
     let visual = visualUrl ? `<a href="${visualUrl}" target="_blank">Visual</a>` : "-";
 
     let row = `<tr>
       <td>${fmtTime(r.ts)}</td>
       <td>${r.pair}</td>
+      <td>${highProb}</td>
       <td class="${typeClass}">${r.signal_type}</td>
       <td class="${dirClass}">${r.direction}</td>
       <td>${r.strength.toFixed(3)}</td>
@@ -3440,7 +3677,7 @@ async function loadSignals() {
 
     tbody.innerHTML += row;
   }
-  applyDirFilter('signals', 'signals-dir-filter', 3);
+  applyDirFilter('signals', 'signals-dir-filter', 4);
   highlightPriorityPair('signals', 1); // Pair is in kolom 1
 }
 
@@ -3568,10 +3805,17 @@ async function loadForecast() {
   for (let r of data) {
     let fmtTime = new Date(r.ts * 1000).toLocaleTimeString();
     let pctClass = r.pct_change_target > 0 ? "pos" : (r.pct_change_target < 0 ? "neg" : "");
-    tbody.innerHTML += `<tr>
-      <td>${fmtTime}</td><td>${r.pair}</td><td>${r.trades_buys}/${r.trades_sells}</td><td>${r.volume.toFixed(2)}</td><td>€${r.value.toFixed(0)}</td>
-      <td>${r.current_price.toFixed(5)}</td><td>${r.target_price.toFixed(5)}</td><td class="${pctClass}">${r.pct_change_target.toFixed(2)}%</td>
-      <td>${r.probability.toFixed(0)}%</td><td>${r.duration_min}</td>
+    tbody.innerHTML = tbody.innerHTML + `<tr>
+      <td>${fmtTime}</td>
+      <td>${r.pair}</td>
+      <td class="${pctClass}">${r.pct_change_target.toFixed(2)}%</td>
+      <td>${r.trades_buys}/${r.trades_sells}</td>
+      <td>${r.volume.toFixed(2)}</td>
+      <td>€${r.value.toFixed(0)}</td>
+      <td>${r.current_price.toFixed(5)}</td>
+      <td>${r.target_price.toFixed(5)}</td>
+      <td>${r.probability.toFixed(0)}%</td>
+      <td>${r.duration_min}</td>
     </tr>`;
   }
   highlightPriorityPair('forecast-table', 1); // Pair in kolom 1
@@ -3822,11 +4066,16 @@ async function loadBacktest() {
   try {
     let res = await fetch("/api/backtest");
     let data = await res.json();
+
+    // Vang zowel oude (array) als nieuwe (object) responses af
+    let strategies = Array.isArray(data) ? data : (data.strategies || []);
+    let highRise = Array.isArray(data.high_rise_logic) ? data.high_rise_logic : [];
+
     let tbody = document.querySelector("#backtest-table tbody");
     if (!tbody) return;
     tbody.innerHTML = "";
 
-    data.forEach((r, idx) => {
+    strategies.forEach((r, idx) => {
       let tr = document.createElement("tr");
       tr.innerHTML = `
         <td>${r.signal_type}</td>
@@ -3848,14 +4097,35 @@ async function loadBacktest() {
       tbody.appendChild(tr);
     });
 
-    if (data.length > 0) {
-      drawEquityCurve(data[0]);
+    if (strategies.length > 0) {
+      drawEquityCurve(strategies[0]);
     } else {
       let canvas = document.getElementById("backtest-equity");
       let ctx = canvas.getContext("2d");
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       document.getElementById("backtest-equity-label").textContent =
         "Nog geen backtest-data (self-evaluator moet eerst enkele signals afronden).";
+    }
+
+    // High-Rise Logic tabel vullen
+    let highBody = document.querySelector("#highrise-table tbody");
+    if (highBody) {
+      highBody.innerHTML = "";
+      highRise.forEach(r => {
+        highBody.innerHTML += `
+          <tr>
+            <td>${r.threshold.toFixed(1)}%</td>
+            <td>${r.occurrences}</td>
+            <td>${r.avg_whale_pred_score.toFixed(2)}</td>
+            <td>${r.avg_pump_score.toFixed(2)}</td>
+            <td>${r.avg_flow_pct.toFixed(2)}%</td>
+            <td>${r.avg_momentum.toFixed(2)}%</td>
+          </tr>
+        `;
+      });
+      if (highRise.length === 0) {
+        highBody.innerHTML = `<tr><td colspan="6">Nog geen high-rise data beschikbaar.</td></tr>`;
+      }
     }
   } catch (e) {
     console.error("Backtest load error:", e);
@@ -4088,7 +4358,8 @@ async function loadStars() {
             let visual = visualUrl ? `<a href="${visualUrl}" target="_blank">Visual</a>` : "-";
 
             let predClass = r.whale_pred_label === "HIGH" ? "pred_high" :
-              (r.whale_pred_label === "MEDIUM" ? "pred_med" : "pred_low");
+              (r.whale_pred_label === "MEDIUM" ? "pred_med" :
+              (r.whale_pred_label === "LOW" ? "pred_low" : "pred_low"));
             let relClass = r.reliability_label === "HIGH" ? "rel_high" :
               (r.reliability_label === "MEDIUM" ? "rel_med" :
               (r.reliability_label === "LOW" ? "rel_low" : "rel_bad"));
@@ -4357,7 +4628,8 @@ window.addEventListener("load", () => {
 
 // Event listeners voor filters
 document.getElementById('markets-dir-filter').addEventListener('change', () => applyDirFilter('grid', 'markets-dir-filter', 6)); // Adjusted for new Time column
-document.getElementById('signals-dir-filter').addEventListener('change', () => applyDirFilter('signals', 'signals-dir-filter', 3));
+document.getElementById('signals-dir-filter').addEventListener('change', () => loadSignals());
+document.getElementById('signals-type-filter').addEventListener('change', () => loadSignals());
 document.getElementById('top10-dir-filter').addEventListener('change', () => {
   applyDirFilter('top3', 'top10-dir-filter', 5);
   applyDirFilter('top10-up', 'top10-dir-filter', 5);
@@ -4678,7 +4950,7 @@ async fn run_priority_pair_scanner(engine: Engine, config: Arc<Mutex<AppConfig>>
             if let Ok(resp) = client.get(&url).send().await {
                 if let Ok(json) = resp.json::<Value>().await {
                     if let Some(obj) = json["result"].as_object() {
-                        for (k, v) in obj.iter() {
+                        for (_k, v) in obj.iter() {  // renamed k -> _k to silence unused variable warning
                             let last_str = v["c"][0].as_str().unwrap_or("0");
                             let vol_str = v["v"][1].as_str().unwrap_or("0");
                             let open_str = v["o"].as_str().unwrap_or("0");
@@ -4834,6 +5106,11 @@ async fn run_self_evaluator(engine: Engine) {
                 ev.ret_5m = Some(ret);
                 ev.eval_horizon_sec = Some(now_ts - ev.ts);
 
+                // momentum bewaren (als nog 0, herbereken)
+                if ev.momentum == 0.0 {
+                    ev.momentum = compute_momentum(ev.pct, ev.pump_score, ev.flow_pct);
+                }
+
                 ev.evaluated = true;
                 updated = true;
             }
@@ -4963,6 +5240,69 @@ async fn run_aggressive_cleanup(engine: Engine) {
 // HOOFDSTUK 14 – HTTP SERVER & API (MET HEALTH ENDPOINT UITGEBREID + FORECAST ENDPOINT + PRIORITY PAIR API)
 // ============================================================================
 
+// NIEUW: High-Rise persistente opslag lokaal (JSON)
+async fn load_high_rise_local() -> Option<Vec<HighRiseLogic>> {
+    match tokio::fs::read_to_string(HIGH_RISE_FILE).await {
+        Ok(content) => {
+            serde_json::from_str(content.as_str()).ok().map(|mut v: Vec<HighRiseLogic>| {
+                let ts_now = Utc::now().timestamp();
+                for item in v.iter_mut() {
+                    if item.updated_at.is_none() {
+                        item.updated_at = Some(ts_now);
+                    }
+                }
+                v
+            })
+        }
+        Err(_) => None,
+    }
+}
+
+async fn save_high_rise_local(data: &[HighRiseLogic]) -> Result<(), Box<dyn std::error::Error>> {
+    let json = serde_json::to_string_pretty(data)?;
+    tokio::fs::write(HIGH_RISE_FILE, json).await?;
+    Ok(())
+}
+
+async fn fetch_highrise_remote(cfg: &AppConfig) -> Option<Vec<HighRiseLogic>> {
+    let url = cfg.high_rise_store_url.as_ref()?;
+    let client = reqwest::Client::new();
+    let mut req = client.get(url);
+    if let Some(tok) = &cfg.high_rise_store_token {
+        req = req.bearer_auth(tok);
+    }
+    let resp = req.send().await.ok()?.error_for_status().ok()?;
+    let mut data: Vec<HighRiseLogic> = resp.json().await.ok()?;
+    let ts_now = Utc::now().timestamp();
+    for d in data.iter_mut() {
+        if d.updated_at.is_none() {
+            d.updated_at = Some(ts_now);
+        }
+    }
+    Some(data)
+}
+
+async fn store_highrise_remote(cfg: &AppConfig, data: &[HighRiseLogic]) -> Option<()> {
+    let url = cfg.high_rise_store_url.as_ref()?;
+    let client = reqwest::Client::new();
+    let mut req = client.put(url).json(data);
+    if let Some(tok) = &cfg.high_rise_store_token {
+        req = req.bearer_auth(tok);
+    }
+    let _ = req.send().await.ok()?.error_for_status().ok()?;
+    Some(())
+}
+
+// NIEUW: hulpfunctie om te bepalen of high-rise data betekenisvol is (niet alleen nullen)
+fn highrise_has_nonzero(data: &[HighRiseLogic]) -> bool {
+    data.iter().any(|h| {
+        h.occurrences > 0
+            || h.avg_whale_pred_score > 0.0
+            || h.avg_pump_score > 0.0
+            || h.avg_flow_pct > 0.0
+            || h.avg_momentum > 0.0
+    })
+}
 
 async fn run_http(engine: Engine, config: Arc<Mutex<AppConfig>>) {
     let engine_filter = warp::any().map(move || engine.clone());
@@ -4986,7 +5326,38 @@ async fn run_http(engine: Engine, config: Arc<Mutex<AppConfig>>) {
 
     let api_backtest = warp::path!("api" / "backtest")
         .and(engine_filter.clone())
-        .map(|engine: Engine| warp::reply::json(&engine.backtest_snapshot()));
+        .and(config_filter.clone())
+        .and_then(|engine: Engine, cfg: Arc<Mutex<AppConfig>>| async move {
+            let local = engine.backtest_snapshot();
+            let cfg_guard = cfg.lock().unwrap().clone();
+
+            // Fallbacks: eerst remote, dan lokaal bestand, maar de nieuwe berekening is leidend
+            let mut response = local.clone();
+
+            // als geen nieuwe high_rise_logic (lege lijst), gebruik lokale file
+            if response.high_rise_logic.is_empty() {
+                if let Some(stored_local) = load_high_rise_local().await {
+                    if !stored_local.is_empty() {
+                        response.high_rise_logic = stored_local;
+                    }
+                }
+            }
+
+            // probeer remote te lezen (optioneel) en gebruik als het niet leeg is
+            if let Some(remote) = fetch_highrise_remote(&cfg_guard).await {
+                if !remote.is_empty() {
+                    response.high_rise_logic = remote;
+                }
+            }
+
+            // sla alleen op als er betekenisvolle (niet-nul) waarden zijn
+            if highrise_has_nonzero(&response.high_rise_logic) {
+                let _ = save_high_rise_local(&response.high_rise_logic).await;
+                let _ = store_highrise_remote(&cfg_guard, &response.high_rise_logic).await;
+            }
+
+            Ok::<_, warp::Rejection>(warp::reply::json(&response))
+        });
 
     let api_manual_trades = warp::path!("api" / "manual_trades")
         .and(engine_filter.clone())
@@ -5196,9 +5567,7 @@ async fn run_watchdog(engine: Engine) -> Result<(), Box<dyn std::error::Error>> 
         sleep(Duration::from_secs(30)).await;
         // Alleen monitoren en counters bijwerken – geen nieuwe taken
         {
-            let mut counts = SELF_HEALING_COUNTS.lock().unwrap();
-            // Bijv. check of WS workers nog leven (optioneel, zonder spawn)
-            // counts.increment_anomaly(); // Alleen als nodig, niet elke iteratie
+            let counts = SELF_HEALING_COUNTS.lock().unwrap(); // mut verwijderd, niet nodig
             println!("[WATCHDOG] Monitoring: {} total restarts", counts.total_restarts);
         }
         // Optionele verbetering voor betrouwbaarheid: Health check via shared flag in Engine
