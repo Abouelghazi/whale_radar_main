@@ -543,6 +543,10 @@ struct HighRiseLogic {
     avg_momentum: f64,
     #[serde(default)]
     updated_at: Option<i64>,
+    #[serde(default)]
+    total_signals: usize,
+    #[serde(default)]
+    hit_rate: f64,
 }
 
 // NIEUW: Backtest response met strategieën + high-rise logica
@@ -2198,23 +2202,60 @@ impl Engine {
     }
 
     fn calc_high_prob(ev: &SignalEvent, hrs: &[HighRiseLogic]) -> Option<f64> {
+        // Guardrails: only BUY, no stablecoins, basic strength + recency
+        if ev.direction != "BUY" {
+            return None;
+        }
+        if is_stablecoin(&ev.pair) {
+            return None;
+        }
+        if ev.flow_pct < 55.0 {
+            return None;
+        }
+        let momentum_val = if ev.momentum == 0.0 {
+            compute_momentum(ev.pct, ev.pump_score, ev.flow_pct)
+        } else {
+            ev.momentum
+        };
+        if momentum_val < 50.0 {
+            return None;
+        }
+        if ev.pump_score < 3.0 {
+            return None;
+        }
+        if ev.whale_pred_score < 4.0 {
+            return None;
+        }
+        let now_ts = Utc::now().timestamp();
+        if now_ts.saturating_sub(ev.ts) > 180 {
+            return None;
+        }
+
         // thresholds in desc order
         let mut sorted = hrs.to_vec();
         sorted.sort_by(|a, b| b.threshold.partial_cmp(&a.threshold).unwrap());
 
         for h in sorted.iter() {
-            if h.occurrences == 0 {
+            let (min_occ, min_hit) = if h.threshold >= 15.0 {
+                (5, 35.0)
+            } else if h.threshold >= 10.0 {
+                (10, 45.0)
+            } else {
+                (15, 50.0)
+            };
+
+            if h.occurrences < min_occ {
                 continue;
             }
-            let mom = if ev.momentum == 0.0 {
-                compute_momentum(ev.pct, ev.pump_score, ev.flow_pct)
-            } else {
-                ev.momentum
-            };
+            if h.hit_rate < min_hit {
+                continue;
+            }
+
+            // Matches relative strength
             if ev.whale_pred_score >= h.avg_whale_pred_score
                 && ev.pump_score >= h.avg_pump_score
                 && ev.flow_pct >= h.avg_flow_pct
-                && mom >= h.avg_momentum
+                && momentum_val >= h.avg_momentum
             {
                 return Some(h.threshold.min(100.0));
             }
@@ -2382,6 +2423,11 @@ impl Engine {
         let thresholds = [5.0_f64, 10.0_f64, 15.0_f64];
         let mut high_rise_logic = Vec::new();
 
+        let total_signals_buy = sigs_vec
+            .iter()
+            .filter(|ev| ev.evaluated && ev.direction == "BUY" && ev.ret_5m.is_some())
+            .count();
+
         for th in thresholds {
             let mut count = 0usize;
             let mut sum_whale_pred = 0.0;
@@ -2423,6 +2469,12 @@ impl Engine {
                 )
             };
 
+            let hit_rate = if total_signals_buy > 0 {
+                (count as f64 / total_signals_buy as f64) * 100.0
+            } else {
+                0.0
+            };
+
             high_rise_logic.push(HighRiseLogic {
                 threshold: th,
                 occurrences: count,
@@ -2431,6 +2483,8 @@ impl Engine {
                 avg_flow_pct: avg_flow,
                 avg_momentum: avg_mom,
                 updated_at: Some(Utc::now().timestamp()),
+                total_signals: total_signals_buy,
+                hit_rate,
             });
         }
 
@@ -4351,7 +4405,7 @@ async function loadStars() {
             let pctClass = r.pct > 0 ? "pos" : (r.pct < 0 ? "neg" : "");
             let flowColor = r.dir === "BUY" ? "#4caf50" : "#f44336";
             let whaleText = r.whale
-              ? (r.whale_side.toUpperCase() + " " + r.whale_volume.toFixed(3) +
+              ? (r.whale_side.toUpperCase() + r.whale_volume.toFixed(3) +
                  " (" + (r.whale_notional/1000).toFixed(1) + "k)")
               : "No";
             let visualUrl = buildVisualUrl(r.pair);
