@@ -176,6 +176,12 @@ struct AppConfig {
     forecast_pump_min: f64,
     forecast_whale_pred_min: f64,
     forecast_spread_max_bps: f64,
+    // NIEUW: Configureerbare drempels en refresh rates
+    high_prob_threshold: f64,
+    high_prob_momentum_min: f64,
+    forecast_flow_min_override: Option<f64>,
+    alert_strength_threshold: f64,  // Reserved for future alert functionality
+    refresh_rate_secs: u64,
 }
 
 impl Default for AppConfig {
@@ -225,6 +231,12 @@ impl Default for AppConfig {
             forecast_pump_min: 3.0,
             forecast_whale_pred_min: 4.0,
             forecast_spread_max_bps: 10.0,
+            // NIEUW: Configureerbare drempels defaults
+            high_prob_threshold: 55.0,
+            high_prob_momentum_min: 50.0,
+            forecast_flow_min_override: None,
+            alert_strength_threshold: 40.0,  // Reserved for future alert functionality
+            refresh_rate_secs: 5,
         }
     }
 }
@@ -864,10 +876,12 @@ struct Engine {
     stars_history: Arc<Mutex<StarsHistory>>,
     // NIEUW: cache voor high rise logic
     high_rise_cache: Arc<Mutex<Option<Vec<HighRiseLogic>>>>,
+    // NIEUW: config reference voor runtime configuratie
+    config: Arc<Mutex<AppConfig>>,
 }
 
 impl Engine {
-    fn new() -> Self {
+    fn new(config: Arc<Mutex<AppConfig>>) -> Self {
         Self {
             trades: Arc::new(DashMap::new()),
             candles: Arc::new(DashMap::new()),
@@ -879,6 +893,7 @@ impl Engine {
             manual_trader: Arc::new(Mutex::new(ManualTraderState::new())),
             stars_history: Arc::new(Mutex::new(StarsHistory { history: Vec::new(), dirty: false })),
             high_rise_cache: Arc::new(Mutex::new(None)),
+            config,
         }
     }
 
@@ -980,7 +995,10 @@ impl Engine {
         let v1 = 0.9 * v0 + 0.1 * volume;
         t.ewma_volume = Some(v1);
 
-        let min_notional = 5_000.0_f64;
+        let min_notional = {
+            let cfg = self.config.lock().unwrap();
+            cfg.whale_min_notional
+        };
         let is_whale = notional > min_notional && notional > n1 * 2.5;
         if is_whale {
             t.last_whale = true;
@@ -2203,7 +2221,7 @@ impl Engine {
         rows
     }
 
-    fn signals_snapshot(&self) -> Vec<SignalEvent> {
+    fn signals_snapshot(&self, config: &AppConfig) -> Vec<SignalEvent> {
         let buf = self.signals.lock().unwrap();
         let mut v: Vec<SignalEvent> = buf.iter().cloned().collect();
         drop(buf);
@@ -2218,14 +2236,14 @@ impl Engine {
             }
             ev.high_prob_pct = hr_list
                 .as_ref()
-                .and_then(|hrs| Self::calc_high_prob(ev, hrs));
+                .and_then(|hrs| Self::calc_high_prob(ev, hrs, config));
         }
 
         v.sort_by(|a, b| b.ts.cmp(&a.ts));
         v
     }
 
-    fn calc_high_prob(ev: &SignalEvent, hrs: &[HighRiseLogic]) -> Option<f64> {
+    fn calc_high_prob(ev: &SignalEvent, hrs: &[HighRiseLogic], config: &AppConfig) -> Option<f64> {
         // Guardrails: only BUY, no stablecoins, basic strength + recency
         if ev.direction != "BUY" {
             return None;
@@ -2233,7 +2251,7 @@ impl Engine {
         if is_stablecoin(&ev.pair) {
             return None;
         }
-        if ev.flow_pct < 55.0 {
+        if ev.flow_pct < config.high_prob_threshold {
             return None;
         }
         let momentum_val = if ev.momentum == 0.0 {
@@ -2241,13 +2259,13 @@ impl Engine {
         } else {
             ev.momentum
         };
-        if momentum_val < 50.0 {
+        if momentum_val < config.high_prob_momentum_min {
             return None;
         }
-        if ev.pump_score < 3.0 {
+        if ev.pump_score < config.forecast_pump_min {
             return None;
         }
-        if ev.whale_pred_score < 4.0 {
+        if ev.whale_pred_score < config.forecast_whale_pred_min {
             return None;
         }
         let now_ts = Utc::now().timestamp();
@@ -2727,7 +2745,8 @@ impl Engine {
             let momentum = compute_momentum(r.pct, r.pump_score, r.flow_pct);
 
             // Pre-filters: alleen sterke kandidaten
-            if flow_pct < config.forecast_flow_min {
+            let flow_min = config.forecast_flow_min_override.unwrap_or(config.forecast_flow_min);
+            if flow_pct < flow_min {
                 continue;
             }
             if momentum < config.forecast_momentum_min {
@@ -3473,6 +3492,18 @@ tr:nth-child(even){ background:#252525; }
       <input type="number" step="0.1" min="0.0" max="10.0" id="forecast_whale_pred_min" /><br/>
       <label>Forecast Max Spread Bps:</label>
       <input type="number" step="1" min="0" max="1000" id="forecast_spread_max_bps" /><br/>
+
+      <h3>8. Aanvullende Drempels & Scanner Instellingen</h3>
+      <label>High Prob Threshold (Min Flow %, 0-100):</label>
+      <input type="number" step="1" min="0" max="100" id="high_prob_threshold" /><br/>
+      <label>High Prob Momentum Min (Min Momentum voor High Prob, 0-100):</label>
+      <input type="number" step="1" min="0" max="100" id="high_prob_momentum_min" /><br/>
+      <label>Forecast Flow Min Override (Optioneel, 0-100, laat leeg voor default):</label>
+      <input type="number" step="1" min="0" max="100" id="forecast_flow_min_override" placeholder="Optioneel" /><br/>
+      <label>Alert Strength Threshold (0-100, gereserveerd voor toekomstige alerts):</label>
+      <input type="number" step="1" min="0" max="100" id="alert_strength_threshold" /><br/>
+      <label>Priority Scanner Refresh Rate (seconden, 1-60):</label>
+      <input type="number" step="1" min="1" max="60" id="refresh_rate_secs" /><br/>
 
       <button type="button" id="save-config">Save Config</button>
       <button type="button" id="reset-config">Reset to Defaults</button>
@@ -4572,7 +4603,12 @@ async function loadConfig() {
         if (el.type === 'checkbox') {
           el.checked = cfg[key];
         } else {
-          el.value = cfg[key];
+          // Handle null/undefined optional values
+          if (cfg[key] === null || cfg[key] === undefined) {
+            el.value = '';
+          } else {
+            el.value = cfg[key];
+          }
         }
       }
     });
@@ -4678,7 +4714,19 @@ window.addEventListener("load", () => {
       } else if (el.type === 'number') {
         // FIX: Vervang komma door punt voor parseFloat
         let val = el.value.replace(',', '.');
-        cfg[el.id] = parseFloat(val);
+        // Handle optional field: forecast_flow_min_override
+        if (el.id === 'forecast_flow_min_override' && (!val || val === '')) {
+          cfg[el.id] = null;
+        } else {
+          // Use parseInt for integer fields
+          if (el.id === 'refresh_rate_secs' || el.id === 'max_positions' || el.id === 'ws_workers_per_chunk' || 
+              el.id === 'rest_scan_interval_sec' || el.id === 'cleanup_interval_sec' || 
+              el.id === 'eval_horizon_sec' || el.id === 'max_history') {
+            cfg[el.id] = parseInt(val);
+          } else {
+            cfg[el.id] = parseFloat(val);
+          }
+        }
       } else {
         cfg[el.id] = el.value;
       }
@@ -4848,7 +4896,11 @@ async fn run_http(engine: Engine, config: Arc<Mutex<AppConfig>>) {
 
     let api_signals = warp::path!("api" / "signals")
         .and(engine_filter.clone())
-        .map(|engine: Engine| warp::reply::json(&engine.signals_snapshot()));
+        .and(config_filter.clone())
+        .map(|engine: Engine, cfg: Arc<Mutex<AppConfig>>| {
+            let config = cfg.lock().unwrap();
+            warp::reply::json(&engine.signals_snapshot(&config))
+        });
 
     let api_top10 = warp::path!("api" / "top10")
         .and(engine_filter.clone())
@@ -5172,7 +5224,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let config = Arc::new(Mutex::new(load_config().await));
-    let engine = Engine::new();
+    let engine = Engine::new(config.clone());
     
     // Load manual trader state from JSON
     engine.load_manual_trader().await;
@@ -5708,16 +5760,21 @@ async fn run_orderbook_worker(
 
 // NIEUW: Priority Pair Scanner
 async fn run_priority_pair_scanner(engine: Engine, config: Arc<Mutex<AppConfig>>) -> Result<(), Box<dyn std::error::Error>> {
-    println!("[PRIORITY SCANNER] Started, checking every 5 seconds");
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()?;
 
+    let mut last_refresh_rate = 0u64;
     loop {
-        let priority_pair = {
+        let (priority_pair, refresh_rate) = {
             let cfg = config.lock().unwrap();
-            cfg.priority_pair.clone()
+            (cfg.priority_pair.clone(), cfg.refresh_rate_secs)
         };
+
+        if refresh_rate != last_refresh_rate {
+            println!("[PRIORITY SCANNER] Refresh rate set to {} seconds", refresh_rate);
+            last_refresh_rate = refresh_rate;
+        }
 
         if let Some(pair) = priority_pair {
             let kraken_pair = denormalize_pair(&pair);
@@ -5747,7 +5804,7 @@ async fn run_priority_pair_scanner(engine: Engine, config: Arc<Mutex<AppConfig>>
             }
         }
 
-        sleep(Duration::from_secs(5)).await; // Elke 5 seconden voor priority pair
+        sleep(Duration::from_secs(refresh_rate)).await;
     }
 }
 
