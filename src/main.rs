@@ -178,9 +178,9 @@ struct AppConfig {
     forecast_spread_max_bps: f64,
     // NIEUW: Configureerbare drempels en refresh rates
     high_prob_threshold: f64,
-    forecast_strength_min: f64,
+    high_prob_momentum_min: f64,
     forecast_flow_min_override: Option<f64>,
-    alert_strength_threshold: f64,
+    alert_strength_threshold: f64,  // Reserved for future alert functionality
     refresh_rate_secs: u64,
 }
 
@@ -233,9 +233,9 @@ impl Default for AppConfig {
             forecast_spread_max_bps: 10.0,
             // NIEUW: Configureerbare drempels defaults
             high_prob_threshold: 55.0,
-            forecast_strength_min: 50.0,
+            high_prob_momentum_min: 50.0,
             forecast_flow_min_override: None,
-            alert_strength_threshold: 40.0,
+            alert_strength_threshold: 40.0,  // Reserved for future alert functionality
             refresh_rate_secs: 5,
         }
     }
@@ -2259,7 +2259,7 @@ impl Engine {
         } else {
             ev.momentum
         };
-        if momentum_val < config.forecast_strength_min {
+        if momentum_val < config.high_prob_momentum_min {
             return None;
         }
         if ev.pump_score < config.forecast_pump_min {
@@ -3496,11 +3496,11 @@ tr:nth-child(even){ background:#252525; }
       <h3>8. Aanvullende Drempels & Scanner Instellingen</h3>
       <label>High Prob Threshold (Min Flow %, 0-100):</label>
       <input type="number" step="1" min="0" max="100" id="high_prob_threshold" /><br/>
-      <label>Forecast Strength Min (Min Momentum, 0-100):</label>
-      <input type="number" step="1" min="0" max="100" id="forecast_strength_min" /><br/>
+      <label>High Prob Momentum Min (Min Momentum voor High Prob, 0-100):</label>
+      <input type="number" step="1" min="0" max="100" id="high_prob_momentum_min" /><br/>
       <label>Forecast Flow Min Override (Optioneel, 0-100, laat leeg voor default):</label>
       <input type="number" step="1" min="0" max="100" id="forecast_flow_min_override" placeholder="Optioneel" /><br/>
-      <label>Alert Strength Threshold (0-100):</label>
+      <label>Alert Strength Threshold (0-100, gereserveerd voor toekomstige alerts):</label>
       <input type="number" step="1" min="0" max="100" id="alert_strength_threshold" /><br/>
       <label>Priority Scanner Refresh Rate (seconden, 1-60):</label>
       <input type="number" step="1" min="1" max="60" id="refresh_rate_secs" /><br/>
@@ -4718,7 +4718,14 @@ window.addEventListener("load", () => {
         if (el.id === 'forecast_flow_min_override' && (!val || val === '')) {
           cfg[el.id] = null;
         } else {
-          cfg[el.id] = parseFloat(val);
+          // Use parseInt for integer fields
+          if (el.id === 'refresh_rate_secs' || el.id === 'max_positions' || el.id === 'ws_workers_per_chunk' || 
+              el.id === 'rest_scan_interval_sec' || el.id === 'cleanup_interval_sec' || 
+              el.id === 'eval_horizon_sec' || el.id === 'max_history') {
+            cfg[el.id] = parseInt(val);
+          } else {
+            cfg[el.id] = parseFloat(val);
+          }
         }
       } else {
         cfg[el.id] = el.value;
@@ -5753,20 +5760,21 @@ async fn run_orderbook_worker(
 
 // NIEUW: Priority Pair Scanner
 async fn run_priority_pair_scanner(engine: Engine, config: Arc<Mutex<AppConfig>>) -> Result<(), Box<dyn std::error::Error>> {
-    let refresh_rate = {
-        let cfg = config.lock().unwrap();
-        cfg.refresh_rate_secs
-    };
-    println!("[PRIORITY SCANNER] Started, checking every {} seconds", refresh_rate);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()?;
 
+    let mut last_refresh_rate = 0u64;
     loop {
         let (priority_pair, refresh_rate) = {
             let cfg = config.lock().unwrap();
             (cfg.priority_pair.clone(), cfg.refresh_rate_secs)
         };
+
+        if refresh_rate != last_refresh_rate {
+            println!("[PRIORITY SCANNER] Refresh rate set to {} seconds", refresh_rate);
+            last_refresh_rate = refresh_rate;
+        }
 
         if let Some(pair) = priority_pair {
             let kraken_pair = denormalize_pair(&pair);
