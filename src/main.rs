@@ -37,11 +37,13 @@
 // - NIEUW: Signals tabblad Type-filter naast DIR-filter.
 // - NIEUW: High-Rise Logic persistente opslag in lokale JSON + optionele externe endpoint (met skip bij alleen nulwaarden).
 // - NIEUW: High prob kolom in Signals, gebaseerd op high_rise_logic.json (5/10/15%).
+// - Forecast tab omgebouwd naar entry planner met zones, trigger, SL/TP, spread/depth guards.
 // ============================================================================
 
 use chrono::Utc;
 use dashmap::DashMap;
-use futures::{SinkExt, StreamExt};
+use futures::StreamExt;
+use futures::SinkExt;
 use lazy_static::lazy_static;
 use reqwest;
 use serde::{Deserialize, Serialize};
@@ -50,7 +52,7 @@ use std::collections::HashMap;
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
-use tokio::time::{interval, sleep, Duration};
+use tokio::time::{sleep, Duration};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use warp::Filter;
@@ -567,22 +569,32 @@ struct StarsHistory {
 }
 
 // ============================================================================
-// NIEUW: Forecast Struct voor Voorspellingen
+// NIEUW: Forecast Struct voor Voorspellingen (UITGEBREID NAAR ENTRY PLANNER)
 // ============================================================================
 
 #[derive(Debug, Clone, Serialize)]
 struct ForecastRow {
     ts: i64,
     pair: String,
-    trades_buys: u64,
-    trades_sells: u64,
-    volume: f64,
-    value: f64,  // Notional in €
-    current_price: f64,
-    target_price: f64,
-    pct_change_target: f64,  // % stijging/daling naar doel
-    probability: f64,  // Waarschijnlijkheid in %
-    duration_min: u32,  // Duur in minuten
+    // NIEUW: Entry zone (low, mid, high)
+    entry_low: f64,
+    entry_mid: f64,
+    entry_high: f64,
+    // NIEUW: Trigger note
+    trigger_note: String,
+    // NIEUW: SL/TP
+    stop_loss: f64,
+    tp1: f64,
+    tp2: f64,
+    // NIEUW: Spread en depth guards
+    spread_bps: f64,
+    depth_ok: bool,
+    guard_notes: String,
+    // NIEUW: Compact metrics voor filters
+    flow_pct: f64,
+    momentum: f64,
+    pump_score: f64,
+    whale_pred_score: f64,
 }
 
 // ============================================================================
@@ -1911,12 +1923,12 @@ impl Engine {
                             score: total_score, 
                             rating: rating.clone(), 
                             whale_pred_score, 
-                            whale_pred_label: whale_pred_label.clone(), 
-                            reliability_score, 
-                            reliability_label: Self::compute_reliability(&t, ts_int).1, 
-                            buy_trades: t.buy_trades, 
-                            sell_trades: t.sell_trades, 
-                            ts: ts_int, // NIEUW: ts veld toegevoegd
+                        whale_pred_label: whale_pred_label.clone(), 
+                        reliability_score, 
+                        reliability_label: Self::compute_reliability(&t, ts_int).1, 
+                        buy_trades: t.buy_trades, 
+                        sell_trades: t.sell_trades, 
+                        ts: ts_int, // NIEUW: ts veld toegevoegd
                         avg_buy_duration_sec: 0.0,
                         avg_sell_duration_sec: 0.0,
                         avg_neutral_duration_sec: 0.0,
@@ -2180,7 +2192,7 @@ impl Engine {
     }
 
     fn signals_snapshot(&self) -> Vec<SignalEvent> {
-        let mut buf = self.signals.lock().unwrap();
+        let buf = self.signals.lock().unwrap();
         let mut v: Vec<SignalEvent> = buf.iter().cloned().collect();
         drop(buf);
 
@@ -2692,95 +2704,103 @@ impl Engine {
         }
     }
 
-    // NIEUW: Forecast functie voor voorspellingen met verbeteringen
+    // NIEUW: Forecast functie voor entry-planner
     fn forecast_snapshot(&self) -> Vec<ForecastRow> {
-        let (bullish_avg_return, bearish_avg_return) = self.compute_avg_returns();  // NIEUW: Separate bullish/bearish averages
-
+        let now_ts = Utc::now().timestamp();
         let rows = self.snapshot(); // Gebruik snapshot() voor alle actieve pairs
-        let mut forecasts: Vec<ForecastRow> = rows.into_iter().take(50).filter(|r| !is_stablecoin(&r.pair)).map(|r| {  // Toon meer pairs (50), uitsluiten stablecoins
+        let mut forecasts: Vec<ForecastRow> = Vec::new();
+
+        for r in rows.into_iter().take(50).filter(|r| !is_stablecoin(&r.pair)) {
             let flow_pct = r.flow_pct;
             let momentum = compute_momentum(r.pct, r.pump_score, r.flow_pct);
-            let trade_rate = self.compute_trade_rate(&r.pair);  // NIEUW: Trade rate
-            let decay_penalty = self.compute_decay_penalty(&r.pair);  // NIEUW: Decay check
 
-            let mut probability = 30.0;  // Basis neutraal
-            if flow_pct > 70.0 && momentum > 75.0 {
-                probability = 70.0;
-            } else if flow_pct > 60.0 && momentum > 70.0 {
-                probability = 50.0;
-            } else if flow_pct < 30.0 {  // NIEUW: Bearish optie
-                probability = 20.0;
+            // Pre-filters: alleen sterke kandidaten
+            if flow_pct < 55.0
+                || momentum < 60.0
+                || r.pump_score < 3.0
+                || r.whale_pred_score < 4.0
+                || now_ts - r.ts > 180
+            {
+                continue; // Skip als niet sterk genoeg
             }
-            probability = (probability + trade_rate * 10.0 - decay_penalty).clamp(0.0, 100.0);  // NIEUW: Trade rate boost, decay penalty
 
-            // NIEUW: Meer realistische % verandering gebaseerd op momentum en historische averages
-            let base_pct = if flow_pct < 30.0 { -bearish_avg_return } else { bullish_avg_return };
-            let adjusted_pct = base_pct * (momentum / 100.0).clamp(0.5, 2.0);  // NIEUW: Momentum multiplier
-            let target_pct = adjusted_pct.clamp(-5.0, 5.0);  // Beperk tot realistische range (-5% tot +5%)
-
-            let target_price = r.price * (1.0 + target_pct / 100.0);
-            let pct_change_target = ((target_price - r.price) / r.price) * 100.0;
-
-            let value = r.buys * r.price + r.sells * r.price;  // NIEUW: Altijd aggregaat berekenen
-
-            ForecastRow {
-                ts: r.ts, // NIEUW: ts veld gebruikt
-                pair: r.pair,
-                trades_buys: r.buy_trades,
-                trades_sells: r.sell_trades,
-                volume: r.buys + r.sells,
-                value,
-                current_price: r.price,
-                target_price,
-                pct_change_target,
-                probability,
-                duration_min: if momentum > 80.0 { 30 } else { 15 },
+            // Detecteer flag/pullback zone uit recente prices
+            let prices = self.trades.get(&r.pair).map(|t| t.recent_prices.clone()).unwrap_or_default();
+            let zone = detect_flag_zone(&prices);
+            if zone.is_none() {
+                continue; // Skip als geen duidelijke zone
             }
-        }).collect();
+            let (entry_low, entry_mid, entry_high) = zone.unwrap();
 
-        // Sorteer op waarschijnlijkheid descending (hoogste bovenaan)
-        forecasts.sort_by(|a, b| b.probability.partial_cmp(&a.probability).unwrap());
-        forecasts
-    }
+            // Sanity check met ATR: zone niet te breed
+            let atr = short_atr_1m(&prices);
+            if entry_high - entry_low > atr * 2.0 {
+                continue; // Zone te breed, skip
+            }
 
-    // NIEUW: Helper voor separate bullish/bearish gemiddelde returns
-    fn compute_avg_returns(&self) -> (f64, f64) {
-        let sigs = self.signals.lock().unwrap();
-        let mut bullish_returns = Vec::new();
-        let mut bearish_returns = Vec::new();
+            // SL/TP logica
+            let stop_loss = entry_low * 0.998; // 0.2% onder zone-low (conservatief)
+            let tp1 = entry_mid * 1.005; // +0.5% boven mid
+            let tp2 = entry_mid * 1.01; // +1.0% boven mid
 
-        for ev in sigs.iter() {
-            if ev.ret_5m.is_some() {
-                let ret = ev.ret_5m.unwrap();
-                if ev.direction == "BUY" {
-                    bullish_returns.push(ret);
-                } else if ev.direction == "SELL" {
-                    bearish_returns.push(ret);
+            // Trigger note (tekstueel, geen harde check)
+            let trigger_note = "Micro HH + volumetik vs. vorige 2–3 candles".to_string();
+
+            // Spread/depth guards uit orderbook
+            let (spread_bps, depth_ok, guard_notes) = if let Some(ob) = self.orderbooks.get(&r.pair) {
+                let age = now_ts.saturating_sub(ob.timestamp);
+                if age <= 60 { // Recent orderbook
+                    let spread_bps = if let (Some(bid), Some(ask)) = (ob.bids.first(), ob.asks.first()) {
+                        ((ask.0 - bid.0) / ((ask.0 + bid.0) / 2.0)) * 10000.0 // bps
+                    } else {
+                        1000.0 // Wide als geen data
+                    };
+                    let bid_depth: f64 = ob.bids.iter().take(10).map(|(_, v)| v).sum();
+                    let ask_depth: f64 = ob.asks.iter().take(10).map(|(_, v)| v).sum();
+                    let depth_ok = bid_depth > 10.0 && ask_depth > 10.0 && spread_bps <= 10.0; // Arbitrair, aanpassen
+                    let guard_notes = if spread_bps > 10.0 {
+                        "skip: spread too wide".to_string()
+                    } else if !depth_ok {
+                        "skip: low depth".to_string()
+                    } else {
+                        "OK".to_string()
+                    };
+                    (spread_bps, depth_ok, guard_notes)
+                } else {
+                    (1000.0, false, "skip: stale orderbook".to_string())
                 }
+            } else {
+                (1000.0, false, "skip: no orderbook".to_string())
+            };
+
+            // Skip als guards falen
+            if !depth_ok || spread_bps > 10.0 {
+                continue;
             }
+
+            forecasts.push(ForecastRow {
+                ts: r.ts,
+                pair: r.pair,
+                entry_low,
+                entry_mid,
+                entry_high,
+                trigger_note,
+                stop_loss,
+                tp1,
+                tp2,
+                spread_bps,
+                depth_ok,
+                guard_notes,
+                flow_pct,
+                momentum,
+                pump_score: r.pump_score,
+                whale_pred_score: r.whale_pred_score,
+            });
         }
 
-        let bullish_avg = if bullish_returns.is_empty() { 2.5 } else { bullish_returns.iter().sum::<f64>() / bullish_returns.len() as f64 };
-        let bearish_avg = if bearish_returns.is_empty() { -2.5 } else { bearish_returns.iter().sum::<f64>() / bearish_returns.len() as f64 };
-
-        (bullish_avg, bearish_avg)
-    }
-
-    // NIEUW: Trade rate (trades per minuut)
-    fn compute_trade_rate(&self, pair: &str) -> f64 {
-        if let Some(t) = self.trades.get(pair) {
-            let recent_count = t.recent_buys.len() + t.recent_sells.len();
-            recent_count as f64 / 5.0  // Laatste 5 min
-        } else { 0.0 }
-    }
-
-    // NIEUW: Decay penalty (als momentum daalt)
-    fn compute_decay_penalty(&self, pair: &str) -> f64 {
-        if let Some(t) = self.trades.get(pair) {
-            let current_momentum = compute_momentum(t.recent_prices.last().map(|(_, p)| *p).unwrap_or(0.0), t.last_pump_score, t.last_flow_pct);
-            let prev_momentum = compute_momentum(t.recent_prices.get(t.recent_prices.len().saturating_sub(2)).map(|(_, p)| *p).unwrap_or(0.0), t.last_pump_score, t.last_flow_pct);
-            if current_momentum < prev_momentum { 10.0 } else { 0.0 }  // Penalty als decay
-        } else { 0.0 }
+        // Sorteer op momentum descending (hoogste kans eerst)
+        forecasts.sort_by(|a, b| b.momentum.partial_cmp(&a.momentum).unwrap());
+        forecasts
     }
 
     fn build_analysis(row: &Row) -> String {
@@ -2865,38 +2885,39 @@ impl Engine {
 }
 
 // ============================================================================
-// HOOFDSTUK 8 – NORMALISATIE (ASSETS & PAIRS)
+// NIEUW: Hulpfuncties voor zone-detectie en ATR
 // ============================================================================
 
-fn normalize_asset(sym: &str) -> String {
-    match sym {
-        "XBT" | "XXBT" => "BTC".to_string(),
-        "XETH" => "ETH".to_string(),
-        "XXRP" => "XRP".to_string(),
-        "XDG" => "DOGE".to_string(),
-        "XXLM" => "XLM".to_string(),
-        s => s.to_string(),
+fn detect_flag_zone(prices: &[(f64, f64)]) -> Option<(f64, f64, f64)> {
+    if prices.len() < 10 {
+        return None;
     }
+    // Zoek impuls-high: hoogste price in laatste 10 candles
+    let recent = &prices[prices.len().saturating_sub(10)..];
+    let high = recent.iter().map(|(_, p)| *p).fold(f64::MIN, f64::max);
+    // Pullback-low: laagste na impuls (voor flag/pullback zone)
+    let low = recent.iter().map(|(_, p)| *p).fold(f64::MAX, f64::min);
+    let mid = (high + low) / 2.0;
+    Some((low, mid, high))
 }
 
-fn normalize_pair(wsname: &str) -> String {
-    let parts: Vec<&str> = wsname.split('/').collect();
-    if parts.len() != 2 {
-        return wsname.to_string();
+fn short_atr_1m(prices: &[(f64, f64)]) -> f64 {
+    if prices.len() < 2 {
+        return 0.0;
     }
-    let base = normalize_asset(parts[0]);
-    let quote = normalize_asset(parts[1]);
-    format!("{}/{}", base, quote)
-}
-
-// NIEUW: Functie om stablecoins te detecteren
-fn is_stablecoin(pair: &str) -> bool {
-    let base = pair.split('/').next().unwrap_or("");
-    matches!(base, "USDT" | "USDC" | "DAI" | "TUSD" | "BUSD" | "UST" | "FRAX" | "LUSD")
+    let mut trs = Vec::new();
+    for i in 1..prices.len() {
+        let (_, high) = prices[i];
+        let (_, low) = prices[i];
+        let (_, prev_close) = prices[i - 1];
+        let tr = (high - low).max((high - prev_close).abs()).max((low - prev_close).abs());
+        trs.push(tr);
+    }
+    trs.iter().sum::<f64>() / trs.len() as f64
 }
 
 // ============================================================================
-// HOOFDSTUK 9 – FRONTEND (HTML DASHBOARD) – Aangepast voor Priority Pair Selectie in Health Tab + Highlighting in alle tabbladen
+// HOOFDSTUK 9 – FRONTEND (HTML DASHBOARD) – Aangepast voor Confidence + Momentum + Trade Score + Health Tab + Status Kolom + Count Trades Kolom + Forecast Tabblad + Priority Pair Selectie in Health Tab + Tim[...]
 // ============================================================================
 
 const DASHBOARD_HTML: &str = r####"<!DOCTYPE html>
@@ -3129,13 +3150,13 @@ tr:nth-child(even){ background:#252525; }
   </div>
 
   <div id="view-forecast" style="display:none;">
-    <h2>📈 Forecast: Voorspellingen voor Stijgingen</h2>
+    <h2>📈 Forecast: Entry Planner met Zones & Guards</h2>
     <table id="forecast-table">
       <thead>
         <tr>
-          <th>Tijd</th><th>Pair</th><th>% Stijging/Daling</th><th>Trades (Buys/Sells)</th><th>Volume</th><th>Waarde (€)</th>
-          <th>Huidige Prijs (€)</th><th>Doelprijs (€)</th>
-          <th>Waarschijnlijkheid (%)</th><th>Duur (min)</th>
+          <th>Tijd</th><th>Pair</th><th>Entry Zone (Low-Mid-High)</th><th>Trigger</th>
+          <th>SL</th><th>TP1</th><th>TP2</th><th>Spread (bps)</th><th>Depth OK?</th>
+          <th>Flow/Mom/Pump/WhPred</th><th>Guards</th>
         </tr>
       </thead>
       <tbody></tbody>
@@ -3858,18 +3879,20 @@ async function loadForecast() {
   tbody.innerHTML = "";
   for (let r of data) {
     let fmtTime = new Date(r.ts * 1000).toLocaleTimeString();
-    let pctClass = r.pct_change_target > 0 ? "pos" : (r.pct_change_target < 0 ? "neg" : "");
-    tbody.innerHTML = tbody.innerHTML + `<tr>
+    let entryZone = `${r.entry_low.toFixed(5)} - ${r.entry_mid.toFixed(5)} - ${r.entry_high.toFixed(5)}`;
+    let metrics = `F:${r.flow_pct.toFixed(1)}% M:${r.momentum.toFixed(1)}% P:${r.pump_score.toFixed(1)} W:${r.whale_pred_score.toFixed(1)}`;
+    tbody.innerHTML += `<tr>
       <td>${fmtTime}</td>
       <td>${r.pair}</td>
-      <td class="${pctClass}">${r.pct_change_target.toFixed(2)}%</td>
-      <td>${r.trades_buys}/${r.trades_sells}</td>
-      <td>${r.volume.toFixed(2)}</td>
-      <td>€${r.value.toFixed(0)}</td>
-      <td>${r.current_price.toFixed(5)}</td>
-      <td>${r.target_price.toFixed(5)}</td>
-      <td>${r.probability.toFixed(0)}%</td>
-      <td>${r.duration_min}</td>
+      <td>${entryZone}</td>
+      <td>${r.trigger_note}</td>
+      <td>${r.stop_loss.toFixed(5)}</td>
+      <td>${r.tp1.toFixed(5)}</td>
+      <td>${r.tp2.toFixed(5)}</td>
+      <td>${r.spread_bps.toFixed(1)}</td>
+      <td>${r.depth_ok ? '✅' : '❌'}</td>
+      <td>${metrics}</td>
+      <td>${r.guard_notes}</td>
     </tr>`;
   }
   highlightPriorityPair('forecast-table', 1); // Pair in kolom 1
@@ -4720,577 +4743,6 @@ tick();
 "####;
 
 // ============================================================================
-// HOOFDSTUK 10 – WEBSOCKET WORKERS
-// ============================================================================
-
-
-async fn run_kraken_worker(
-    engine: Engine,
-    ws_pairs: Vec<String>,
-    worker_id: usize,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let url = "wss://ws.kraken.com";
-
-    let mut backoff = Duration::from_secs(5);
-    loop {
-        println!(
-            "WS{}: connecting to Kraken ({} pairs)...",
-            worker_id,
-            ws_pairs.len()
-        );
-
-        let connect_res = connect_async(url).await;
-        let (ws, _) = match connect_res {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("WS{}: connect error {:?}, retry in {:?}", worker_id, e, backoff);
-                sleep(backoff).await;
-                backoff = (backoff * 2).min(Duration::from_secs(300)); // Max 5 min
-                continue;
-            }
-        };
-
-        println!("WS{}: connected", worker_id);
-
-        let (mut write, mut read) = ws.split();
-
-        let sub = serde_json::json!({
-            "event": "subscribe",
-            "pair": ws_pairs,
-            "subscription": { "name": "trade" }
-        });
-
-        if let Err(e) = write.send(Message::Text(sub.to_string())).await {
-            eprintln!(
-                "WS{}: subscribe send error {:?}, retry in {:?}",
-                worker_id, e, backoff
-            );
-            sleep(backoff).await;
-            backoff = (backoff * 2).min(Duration::from_secs(300));
-            continue;
-        }
-
-        println!(
-            "WS{}: subscribed to {} pairs via WebSocket",
-            worker_id,
-            ws_pairs.len()
-        );
-
-        backoff = Duration::from_secs(5); // Reset bij succes
-
-        while let Some(msg_res) = read.next().await {
-            let msg = match msg_res {
-                Ok(m) => m,
-                Err(e) => {
-                    eprintln!("WS{}: read error {:?}, reconnecting...", worker_id, e);
-                    break;
-                }
-            };
-
-            if let Ok(txt) = msg.to_text() {
-                if txt.contains("\"event\"") {
-                    continue;
-                }
-                if let Ok(val) = serde_json::from_str::<Value>(txt) {
-                    if val.is_array() && val.as_array().unwrap().len() >= 4 {
-                        let arr = val.as_array().unwrap();
-                        let trades = arr[1].as_array().unwrap();
-                        let pair_raw = arr[3].as_str().unwrap_or("UNKNOWN");
-                        let pair = normalize_pair(pair_raw);
-
-                        for t in trades {
-                            let ta = t.as_array().unwrap();
-                            let price: f64 =
-                                ta[0].as_str().unwrap().parse().unwrap_or(0.0);
-                            let vol: f64 =
-                                ta[1].as_str().unwrap().parse().unwrap_or(0.0);
-                            let ts: f64 =
-                                ta[2].as_str().unwrap().parse().unwrap_or(0.0);
-                            let side = ta[3].as_str().unwrap_or("b");
-
-                            if price > 0.0 && vol > 0.0 {
-                                engine.handle_trade(&pair, price, vol, side, ts);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        eprintln!("WS{}: stream ended, reconnecting in {:?}", worker_id, backoff);
-        sleep(backoff).await;
-        backoff = (backoff * 2).min(Duration::from_secs(300));
-    }
-}
-
-async fn run_orderbook_worker(
-    engine: Engine,
-    ws_pairs: Vec<String>,
-    worker_id: usize,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let url = "wss://ws.kraken.com";
-
-    let mut backoff = Duration::from_secs(5);
-    loop {
-        println!(
-            "OB_WS{}: connecting to Kraken orderbook ({} pairs)...",
-            worker_id,
-            ws_pairs.len()
-        );
-
-        let connect_res = connect_async(url).await;
-        let (ws, _) = match connect_res {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("OB_WS{}: connect error {:?}, retry in {:?}", worker_id, e, backoff);
-                sleep(backoff).await;
-                backoff = (backoff * 2).min(Duration::from_secs(300));
-                continue;
-            }
-        };
-
-        println!("OB_WS{}: connected", worker_id);
-
-        let (mut write, mut read) = ws.split();
-
-        // Subscribe to orderbook updates (depth 10)
-        let sub = serde_json::json!({
-            "event": "subscribe",
-            "pair": ws_pairs,
-            "subscription": { "name": "book", "depth": 10 }
-        });
-
-        if let Err(e) = write.send(Message::Text(sub.to_string())).await {
-            eprintln!(
-                "OB_WS{}: subscribe send error {:?}, retry in {:?}",
-                worker_id, e, backoff
-            );
-            sleep(backoff).await;
-            backoff = (backoff * 2).min(Duration::from_secs(300));
-            continue;
-        }
-
-        println!(
-            "OB_WS{}: subscribed to orderbook for {} pairs",
-            worker_id,
-            ws_pairs.len()
-        );
-
-        backoff = Duration::from_secs(5); // Reset bij succes
-
-        while let Some(msg_res) = read.next().await {
-            let msg = match msg_res {
-                Ok(m) => m,
-                Err(e) => {
-                    eprintln!("OB_WS{}: read error {:?}, reconnecting...", worker_id, e);
-                    break;
-                }
-            };
-
-            if let Ok(txt) = msg.to_text() {
-                if txt.contains("\"event\"") {
-                    continue;
-                }
-                if let Ok(val) = serde_json::from_str::<Value>(txt) {
-                    if val.is_array() {
-                        let arr = val.as_array().unwrap();
-                        if arr.len() >= 4 {
-                            let pair_raw = arr[arr.len() - 1].as_str().unwrap_or("UNKNOWN");
-                            let pair = normalize_pair(pair_raw);
-
-                            // Parse orderbook data
-                            if let Some(data) = arr.get(1).and_then(|v| v.as_object()) {
-                                let ts_int = chrono::Utc::now().timestamp();
-                                let mut bids: Vec<(f64, f64)> = Vec::new();
-                                let mut asks: Vec<(f64, f64)> = Vec::new();
-
-                                // Parse bids (either 'b' or 'bs')
-                                if let Some(bid_arr) = data.get("b").or_else(|| data.get("bs")) {
-                                    if let Some(bid_list) = bid_arr.as_array() {
-                                        for item in bid_list {
-                                            if let Some(bid) = item.as_array() {
-                                                if bid.len() >= 2 {
-                                                    let price: f64 = bid[0]
-                                                        .as_str()
-                                                        .unwrap_or("0")
-                                                        .parse()
-                                                        .unwrap_or(0.0);
-                                                    let volume: f64 = bid[1]
-                                                        .as_str()
-                                                        .unwrap_or("0")
-                                                        .parse()
-                                                        .unwrap_or(0.0);
-                                                    if price > 0.0 && volume > 0.0 {
-                                                        bids.push((price, volume));
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-
-                                // Parse asks (either 'a' or 'as')
-                                if let Some(ask_arr) = data.get("a").or_else(|| data.get("as")) {
-                                    if let Some(ask_list) = ask_arr.as_array() {
-                                        for item in ask_list {
-                                            if let Some(ask) = item.as_array() {
-                                                if ask.len() >= 2 {
-                                                    let price: f64 = ask[0]
-                                                        .as_str()
-                                                        .unwrap_or("0")
-                                                        .parse()
-                                                        .unwrap_or(0.0);
-                                                    let volume: f64 = ask[1]
-                                                        .as_str()
-                                                        .unwrap_or("0")
-                                                        .parse()
-                                                        .unwrap_or(0.0);
-                                                    if price > 0.0 && volume > 0.0 {
-                                                        asks.push((price, volume));
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-
-                                // Update orderbook in engine if we have data
-                                if !bids.is_empty() || !asks.is_empty() {
-                                    // Sort bids descending (highest first)
-                                    bids.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-                                    // Sort asks ascending (lowest first)
-                                    asks.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-
-                                    let ob_state = OrderbookState {
-                                        bids,
-                                        asks,
-                                        timestamp: ts_int,
-                                    };
-                                    engine.orderbooks.insert(pair.clone(), ob_state);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        eprintln!("OB_WS{}: stream ended, reconnecting in {:?}", worker_id, backoff);
-        sleep(backoff).await;
-        backoff = (backoff * 2).min(Duration::from_secs(300));
-    }
-}
-
-// ============================================================================
-// NIEUW: Priority Pair Scanner
-// ============================================================================
-
-async fn run_priority_pair_scanner(engine: Engine, config: Arc<Mutex<AppConfig>>) -> Result<(), Box<dyn std::error::Error>> {
-    println!("[PRIORITY SCANNER] Started, checking every 5 seconds");
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()?;
-
-    loop {
-        let priority_pair = {
-            let cfg = config.lock().unwrap();
-            cfg.priority_pair.clone()
-        };
-
-        if let Some(pair) = priority_pair {
-            let kraken_pair = denormalize_pair(&pair);
-            let url = format!("https://api.kraken.com/0/public/Ticker?pair={}", kraken_pair);
-
-            if let Ok(resp) = client.get(&url).send().await {
-                if let Ok(json) = resp.json::<Value>().await {
-                    if let Some(obj) = json["result"].as_object() {
-                        for (_k, v) in obj.iter() {  // renamed k -> _k to silence unused variable warning
-                            let last_str = v["c"][0].as_str().unwrap_or("0");
-                            let vol_str = v["v"][1].as_str().unwrap_or("0");
-                            let open_str = v["o"].as_str().unwrap_or("0");
-
-                            let last: f64 = last_str.parse().unwrap_or(0.0);
-                            let vol24h: f64 = vol_str.parse().unwrap_or(0.0);
-                            let open: f64 = open_str.parse().unwrap_or(0.0);
-
-                            if last > 0.0 && open > 0.0 {
-                                let ts_int = Utc::now().timestamp();
-                                let norm = pair.clone(); // FIX: Gebruik pair.clone() in plaats van key_to_norm.get(k)
-                                engine.handle_ticker(&norm, last, vol24h, open, ts_int);
-                                println!("[PRIORITY] Updated {} at ts {}", norm, ts_int);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        sleep(Duration::from_secs(5)).await; // Elke 5 seconden voor priority pair
-    }
-}
-
-// ============================================================================
-// HOOFDSTUK 11 – REST ANOMALY SCANNER
-// ============================================================================
-
-
-async fn run_anomaly_scanner(
-    engine: Engine,
-    kraken_keys: Vec<String>,
-    key_to_norm: HashMap<String, String>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    println!(
-        "Starting anomaly scanner over {} Kraken pairs (REST)...",
-        kraken_keys.len()
-    );
-
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()?;
-
-    loop {
-        for chunk in kraken_keys.chunks(20) {
-            let keys: Vec<String> = chunk.iter().cloned().collect();
-            let joined = keys.join(",");
-            let url =
-                format!("https://api.kraken.com/0/public/Ticker?pair={}", joined);
-
-            if let Ok(resp) = client.get(&url).send().await {
-                if let Ok(json) = resp.json::<Value>().await {
-                    if let Some(obj) = json["result"].as_object() {
-                        for (k, v) in obj.iter() {
-                            let last_str = v["c"][0].as_str().unwrap_or("0");
-                            let vol_str = v["v"][1].as_str().unwrap_or("0");
-                            let open_str = v["o"].as_str().unwrap_or("0");
-
-                            let last: f64 = last_str.parse().unwrap_or(0.0);
-                            let vol24h: f64 = vol_str.parse().unwrap_or(0.0);
-                            let open: f64 = open_str.parse().unwrap_or(0.0);
-
-                            if last > 0.0 && open > 0.0 {
-                                let ts_int = Utc::now().timestamp();
-                                let norm = key_to_norm
-                                    .get(k)
-                                    .cloned()
-                                    .unwrap_or_else(|| k.clone());
-                                engine.handle_ticker(&norm, last, vol24h, open, ts_int);
-                            }
-                        }
-                    }
-                }
-            }
-
-            sleep(Duration::from_millis(500)).await;
-        }
-
-        sleep(Duration::from_secs(20)).await;
-    }
-}
-
-// ============================================================================
-// HOOFDSTUK 12 – SELF-EVALUATOR (ZELFLEREND)
-// ============================================================================
-
-
-async fn run_self_evaluator(engine: Engine) {
-    loop {
-        sleep(Duration::from_secs(60)).await;
-        let now_ts = Utc::now().timestamp();
-
-        let mut updated = false;
-        {
-            let mut weights = engine.weights.lock().unwrap();
-            let mut sigs = engine.signals.lock().unwrap();
-
-            for ev in sigs.iter_mut() {
-                if ev.evaluated {
-                    continue;
-                }
-                if now_ts - ev.ts < 300 {
-                    continue;
-                }
-                if ev.rating == "NONE" {
-                    ev.evaluated = true;
-                    continue;
-                }
-
-                let current_price = engine
-                    .candles
-                    .get(&ev.pair)
-                    .and_then(|c| c.close)
-                    .unwrap_or(ev.price);
-
-                let ret = (current_price - ev.price) / ev.price * 100.0;
-
-                let success_strong = ret >= 2.0;
-                let success_weak = ret >= 0.5 && ret < 2.0;
-                let fail = ret <= -0.5;
-
-                let strong_step_up = 1.02;
-                let weak_step_up = 1.01;
-                let step_down = 0.98;
-
-                let adjust = |w: &mut f64, factor_score: f64| {
-                    if factor_score <= 0.0 {
-                        return;
-                    }
-                    if success_strong {
-                        *w *= strong_step_up;
-                    } else if success_weak {
-                        *w *= weak_step_up;
-                    } else if fail {
-                        *w *= step_down;
-                    }
-                    if *w < 0.2 {
-                        *w = 0.2;
-                    }
-                    if *w > 5.0 {
-                        *w = 5.0;
-                    }
-                };
-
-                adjust(&mut weights.flow_w, ev.flow_score);
-                adjust(&mut weights.price_w, ev.price_score);
-                adjust(&mut weights.whale_w, ev.whale_score);
-                adjust(&mut weights.volume_w, ev.volume_score);
-                adjust(&mut weights.anomaly_w, ev.anomaly_score);
-                adjust(&mut weights.trend_w, ev.trend_score);
-
-                // backtest-data invullen
-                ev.ret_5m = Some(ret);
-                ev.eval_horizon_sec = Some(now_ts - ev.ts);
-
-                // momentum bewaren (als nog 0, herbereken)
-                if ev.momentum == 0.0 {
-                    ev.momentum = compute_momentum(ev.pct, ev.pump_score, ev.flow_pct);
-                }
-
-                ev.evaluated = true;
-                updated = true;
-            }
-
-            if updated {
-                println!(
-                    "Gewichten geüpdatet -> flow:{:.2} price:{:.2} whale:{:.2} vol:{:.2} anom:{:.2} trend:{:.2}",
-                    weights.flow_w,
-                    weights.price_w,
-                    weights.whale_w,
-                    weights.volume_w,
-                    weights.anomaly_w,
-                    weights.trend_w
-                );
-            }
-        }
-    }
-}
-
-// ============================================================================
-// HOOFDSTUK 13 – CLEANUP & ONDERHOUD (AGRESSIEVER GEMAAKT)
-// ============================================================================
-
-
-async fn run_cleanup(engine: Engine) {
-    loop {
-        sleep(Duration::from_secs(600)).await; // Nog steeds elke 10 min, maar agressiever
-
-        let now = Utc::now().timestamp();
-        let cutoff_trades = now - 12 * 3600;
-        let cutoff_candles = now - 24 * 3600;
-        let cutoff_orderbooks = now - 60; // Remove orderbooks older than 1 minute
-
-        engine.trades.retain(|_, v| v.last_update_ts >= cutoff_trades);
-
-        let mut to_reset = Vec::new();
-        for c in engine.candles.iter() {
-            let last_ts = c.last_ts.unwrap_or(0);
-            if last_ts < cutoff_candles {
-                to_reset.push(c.key().clone());
-            }
-        }
-        for k in to_reset {
-            engine.candles.insert(k, CandleState::default());
-        }
-
-        // Cleanup old orderbooks
-        engine.orderbooks.retain(|_, v| v.timestamp >= cutoff_orderbooks);
-
-        // NIEUW: Reset recente ANOM flags na 5 uur
-        let cutoff_anom = now - (5 * 3600); // 5 uur
-        for mut t in engine.trades.iter_mut() {
-            if t.last_update_ts < cutoff_anom {
-                t.recent_anom = false;
-            }
-        }
-
-        // FIX: Houd alleen signals van laatste 24 uur om Type kolom te vullen
-        {
-            let mut sigs = engine.signals.lock().unwrap();
-            sigs.retain(|ev| now - ev.ts < 86400); // 24 uur
-        }
-
-        // NIEUW: Cleanup dir_history voor entries ouder dan 24 uur
-        let cutoff_dir = now - 86400; // 24 uur
-        for mut t in engine.trades.iter_mut() {
-            t.dir_history.retain(|(ts, _)| *ts >= cutoff_dir);
-        }
-
-        println!("Cleanup: oude trades (>12u), candles (>24u), orderbooks (>1m) en dir_history (>24u) opgeschoond, oude ANOM flags gereset.");
-    }
-}
-
-// NIEUW: Agressieve cleanup elke 5 minuten
-async fn run_aggressive_cleanup(engine: Engine) {
-    let mut interval = interval(Duration::from_secs(300)); // Elke 5 minuten
-    loop {
-        interval.tick().await;
-        let now = Utc::now().timestamp();
-
-        // Log sizes voor debugging
-        let trades_count: usize = engine.trades.iter().map(|_| 1).sum();
-        let candles_count: usize = engine.candles.iter().map(|_| 1).sum();
-        let signals_count = engine.signals.lock().unwrap().len();
-        let stars_count = engine.stars_history.lock().unwrap().history.len();
-        println!("[HEALTH] trades: {}, candles: {}, signals: {}, stars: {}", trades_count, candles_count, signals_count, stars_count);
-
-        // Cleanup trades: verwijder oude pairs volledig na 6 uur inactiviteit
-        let cutoff_old = now - 6 * 3600;
-        engine.trades.retain(|_, v| v.last_update_ts >= cutoff_old);
-
-        // Cleanup candles: max 500 entries totaal
-        let mut candle_keys: Vec<String> = engine.candles.iter().map(|k| k.key().clone()).collect();
-        if candle_keys.len() > 500 {
-            candle_keys.sort_by_key(|k| engine.candles.get(k).map(|c| c.last_update_ts).unwrap_or(0));
-            for key in candle_keys.iter().take(candle_keys.len() - 500) {
-                engine.candles.remove(key);
-            }
-        }
-
-        // Signals: max 200 (strenger dan 400)
-        let mut sigs = engine.signals.lock().unwrap();
-        let sigs_len = sigs.len();
-        if sigs_len > 200 {
-            sigs.drain(0..(sigs_len - 200));
-        }
-        drop(sigs);
-
-        // Stars: max 500 entries (minder dan 1000)
-        let mut history = engine.stars_history.lock().unwrap();
-        let history_len = history.history.len();
-        if history_len > 500 {
-            history.history.drain(0..(history_len - 500));
-            history.dirty = true; // Markeer voor save
-        }
-        drop(history);
-
-        // Orderbooks: max 100 recente
-        let cutoff_ob = now - 120; // 2 minuten
-        engine.orderbooks.retain(|_, v| v.timestamp >= cutoff_ob);
-
-        println!("[CLEANUP] Aggressive cleanup done");
-    }
-}
-
-// ============================================================================
 // HOOFDSTUK 14 – HTTP SERVER & API (MET HEALTH ENDPOINT UITGEBREID + FORECAST ENDPOINT + PRIORITY PAIR API)
 // ============================================================================
 
@@ -5935,4 +5387,595 @@ struct CoinAnalysisResponse {
     history: Vec<(i64, f64, f64, f64, f64, f64)>,
     calculations: HashMap<String, f64>,
     advice: String,
+}
+
+// NIEUW: Definieer run_kraken_worker, etc. hier, na main
+
+fn normalize_asset(sym: &str) -> String {
+    match sym {
+        "XBT" | "XXBT" => "BTC".to_string(),
+        "XETH" => "ETH".to_string(),
+        "XXRP" => "XRP".to_string(),
+        "XDG" => "DOGE".to_string(),
+        "XXLM" => "XLM".to_string(),
+        s => s.to_string(),
+    }
+}
+
+fn normalize_pair(wsname: &str) -> String {
+    let parts: Vec<&str> = wsname.split('/').collect();
+    if parts.len() != 2 {
+        return wsname.to_string();
+    }
+    let base = normalize_asset(parts[0]);
+    let quote = normalize_asset(parts[1]);
+    format!("{}/{}", base, quote)
+}
+
+fn is_stablecoin(pair: &str) -> bool {
+    let base = pair.split('/').next().unwrap_or("");
+    matches!(base, "USDT" | "USDC" | "DAI" | "TUSD" | "BUSD" | "UST" | "FRAX" | "LUSD")
+}
+
+async fn run_kraken_worker(
+    engine: Engine,
+    ws_pairs: Vec<String>,
+    worker_id: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let url = "wss://ws.kraken.com";
+
+    let mut backoff = Duration::from_secs(5);
+    loop {
+        println!(
+            "WS{}: connecting to Kraken ({} pairs)...",
+            worker_id,
+            ws_pairs.len()
+        );
+
+        let connect_res = connect_async(url).await;
+        let (ws, _) = match connect_res {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("WS{}: connect error {:?}, retry in {:?}", worker_id, e, backoff);
+                sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(300)); // Max 5 min
+                continue;
+            }
+        };
+
+        println!("WS{}: connected", worker_id);
+
+        let (mut write, mut read) = ws.split();
+
+        let sub = serde_json::json!({
+            "event": "subscribe",
+            "pair": ws_pairs,
+            "subscription": { "name": "trade" }
+        });
+
+        if let Err(e) = write.send(Message::Text(sub.to_string())).await {
+            eprintln!(
+                "WS{}: subscribe send error {:?}, retry in {:?}",
+                worker_id, e, backoff
+            );
+            sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_secs(300));
+            continue;
+        }
+
+        println!(
+            "WS{}: subscribed to {} pairs via WebSocket",
+            worker_id,
+            ws_pairs.len()
+        );
+
+        backoff = Duration::from_secs(5); // Reset bij succes
+
+        while let Some(msg_res) = read.next().await {
+            let msg = match msg_res {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("WS{}: read error {:?}, reconnecting...", worker_id, e);
+                    break;
+                }
+            };
+
+            if let Ok(txt) = msg.to_text() {
+                if txt.contains("\"event\"") {
+                    continue;
+                }
+                if let Ok(val) = serde_json::from_str::<Value>(txt) {
+                    if val.is_array() && val.as_array().unwrap().len() >= 4 {
+                        let arr = val.as_array().unwrap();
+                        let trades = arr[1].as_array().unwrap();
+                        let pair_raw = arr[3].as_str().unwrap_or("UNKNOWN");
+                        let pair = normalize_pair(pair_raw);
+
+                        for t in trades {
+                            let ta = t.as_array().unwrap();
+                            let price: f64 =
+                                ta[0].as_str().unwrap().parse().unwrap_or(0.0);
+                            let vol: f64 =
+                                ta[1].as_str().unwrap().parse().unwrap_or(0.0);
+                            let ts: f64 =
+                                ta[2].as_str().unwrap().parse().unwrap_or(0.0);
+                            let side = ta[3].as_str().unwrap_or("b");
+
+                            if price > 0.0 && vol > 0.0 {
+                                engine.handle_trade(&pair, price, vol, side, ts);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        eprintln!("WS{}: stream ended, reconnecting in {:?}", worker_id, backoff);
+        sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(300));
+    }
+}
+
+async fn run_orderbook_worker(
+    engine: Engine,
+    ws_pairs: Vec<String>,
+    worker_id: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let url = "wss://ws.kraken.com";
+
+    let mut backoff = Duration::from_secs(5);
+    loop {
+        println!(
+            "OB_WS{}: connecting to Kraken orderbook ({} pairs)...",
+            worker_id,
+            ws_pairs.len()
+        );
+
+        let connect_res = connect_async(url).await;
+        let (ws, _) = match connect_res {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("OB_WS{}: connect error {:?}, retry in {:?}", worker_id, e, backoff);
+                sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(300));
+                continue;
+            }
+        };
+
+        println!("OB_WS{}: connected", worker_id);
+
+        let (mut write, mut read) = ws.split();
+
+        // Subscribe to orderbook updates (depth 10)
+        let sub = serde_json::json!({
+            "event": "subscribe",
+            "pair": ws_pairs,
+            "subscription": { "name": "book", "depth": 10 }
+        });
+
+        if let Err(e) = write.send(Message::Text(sub.to_string())).await {
+            eprintln!(
+                "OB_WS{}: subscribe send error {:?}, retry in {:?}",
+                worker_id, e, backoff
+            );
+            sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_secs(300));
+            continue;
+        }
+
+        println!(
+            "OB_WS{}: subscribed to orderbook for {} pairs",
+            worker_id,
+            ws_pairs.len()
+        );
+
+        backoff = Duration::from_secs(5); // Reset bij succes
+
+        while let Some(msg_res) = read.next().await {
+            let msg = match msg_res {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("OB_WS{}: read error {:?}, reconnecting...", worker_id, e);
+                    break;
+                }
+            };
+
+            if let Ok(txt) = msg.to_text() {
+                if txt.contains("\"event\"") {
+                    continue;
+                }
+                if let Ok(val) = serde_json::from_str::<Value>(txt) {
+                    if val.is_array() {
+                        let arr = val.as_array().unwrap();
+                        if arr.len() >= 4 {
+                            let pair_raw = arr[arr.len() - 1].as_str().unwrap_or("UNKNOWN");
+                            let pair = normalize_pair(pair_raw);
+
+                            // Parse orderbook data
+                            if let Some(data) = arr.get(1).and_then(|v| v.as_object()) {
+                                let ts_int = chrono::Utc::now().timestamp();
+                                let mut bids: Vec<(f64, f64)> = Vec::new();
+                                let mut asks: Vec<(f64, f64)> = Vec::new();
+
+                                // Parse bids (either 'b' or 'bs')
+                                if let Some(bid_arr) = data.get("b").or_else(|| data.get("bs")) {
+                                    if let Some(bid_list) = bid_arr.as_array() {
+                                        for item in bid_list {
+                                            if let Some(bid) = item.as_array() {
+                                                if bid.len() >= 2 {
+                                                    let price: f64 = bid[0]
+                                                        .as_str()
+                                                        .unwrap_or("0")
+                                                        .parse()
+                                                        .unwrap_or(0.0);
+                                                    let volume: f64 = bid[1]
+                                                        .as_str()
+                                                        .unwrap_or("0")
+                                                        .parse()
+                                                        .unwrap_or(0.0);
+                                                    if price > 0.0 && volume > 0.0 {
+                                                        bids.push((price, volume));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Parse asks (either 'a' or 'as')
+                                if let Some(ask_arr) = data.get("a").or_else(|| data.get("as")) {
+                                    if let Some(ask_list) = ask_arr.as_array() {
+                                        for item in ask_list {
+                                            if let Some(ask) = item.as_array() {
+                                                if ask.len() >= 2 {
+                                                    let price: f64 = ask[0]
+                                                        .as_str()
+                                                        .unwrap_or("0")
+                                                        .parse()
+                                                        .unwrap_or(0.0);
+                                                    let volume: f64 = ask[1]
+                                                        .as_str()
+                                                        .unwrap_or("0")
+                                                        .parse()
+                                                        .unwrap_or(0.0);
+                                                    if price > 0.0 && volume > 0.0 {
+                                                        asks.push((price, volume));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Update orderbook in engine if we have data
+                                if !bids.is_empty() || !asks.is_empty() {
+                                    // Sort bids descending (highest first)
+                                    bids.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+                                    // Sort asks ascending (lowest first)
+                                    asks.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+
+                                    let ob_state = OrderbookState {
+                                        bids,
+                                        asks,
+                                        timestamp: ts_int,
+                                    };
+                                    engine.orderbooks.insert(pair.clone(), ob_state);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        eprintln!("OB_WS{}: stream ended, reconnecting in {:?}", worker_id, backoff);
+        sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(300));
+    }
+}
+
+// NIEUW: Priority Pair Scanner
+async fn run_priority_pair_scanner(engine: Engine, config: Arc<Mutex<AppConfig>>) -> Result<(), Box<dyn std::error::Error>> {
+    println!("[PRIORITY SCANNER] Started, checking every 5 seconds");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+
+    loop {
+        let priority_pair = {
+            let cfg = config.lock().unwrap();
+            cfg.priority_pair.clone()
+        };
+
+        if let Some(pair) = priority_pair {
+            let kraken_pair = denormalize_pair(&pair);
+            let url = format!("https://api.kraken.com/0/public/Ticker?pair={}", kraken_pair);
+
+            if let Ok(resp) = client.get(&url).send().await {
+                if let Ok(json) = resp.json::<Value>().await {
+                    if let Some(obj) = json["result"].as_object() {
+                        for (_k, v) in obj.iter() {  // renamed k -> _k to silence unused variable warning
+                            let last_str = v["c"][0].as_str().unwrap_or("0");
+                            let vol_str = v["v"][1].as_str().unwrap_or("0");
+                            let open_str = v["o"].as_str().unwrap_or("0");
+
+                            let last: f64 = last_str.parse().unwrap_or(0.0);
+                            let vol24h: f64 = vol_str.parse().unwrap_or(0.0);
+                            let open: f64 = open_str.parse().unwrap_or(0.0);
+
+                            if last > 0.0 && open > 0.0 {
+                                let ts_int = Utc::now().timestamp();
+                                let norm = pair.clone(); // FIX: Gebruik pair.clone() in plaats van key_to_norm.get(k)
+                                engine.handle_ticker(&norm, last, vol24h, open, ts_int);
+                                println!("[PRIORITY] Updated {} at ts {}", norm, ts_int);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        sleep(Duration::from_secs(5)).await; // Elke 5 seconden voor priority pair
+    }
+}
+
+// ============================================================================
+// HOOFDSTUK 11 – REST ANOMALY SCANNER
+// ============================================================================
+
+
+async fn run_anomaly_scanner(
+    engine: Engine,
+    kraken_keys: Vec<String>,
+    key_to_norm: HashMap<String, String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!(
+        "Starting anomaly scanner over {} Kraken pairs (REST)...",
+        kraken_keys.len()
+    );
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+
+    loop {
+        for chunk in kraken_keys.chunks(20) {
+            let keys: Vec<String> = chunk.iter().cloned().collect();
+            let joined = keys.join(",");
+            let url =
+                format!("https://api.kraken.com/0/public/Ticker?pair={}", joined);
+
+            if let Ok(resp) = client.get(&url).send().await {
+                if let Ok(json) = resp.json::<Value>().await {
+                    if let Some(obj) = json["result"].as_object() {
+                        for (k, v) in obj.iter() {
+                            let last_str = v["c"][0].as_str().unwrap_or("0");
+                            let vol_str = v["v"][1].as_str().unwrap_or("0");
+                            let open_str = v["o"].as_str().unwrap_or("0");
+
+                            let last: f64 = last_str.parse().unwrap_or(0.0);
+                            let vol24h: f64 = vol_str.parse().unwrap_or(0.0);
+                            let open: f64 = open_str.parse().unwrap_or(0.0);
+
+                            if last > 0.0 && open > 0.0 {
+                                let ts_int = Utc::now().timestamp();
+                                let norm = key_to_norm
+                                    .get(k)
+                                    .cloned()
+                                    .unwrap_or_else(|| k.clone());
+                                engine.handle_ticker(&norm, last, vol24h, open, ts_int);
+                            }
+                        }
+                    }
+                }
+            }
+
+            sleep(Duration::from_millis(500)).await;
+        }
+
+        sleep(Duration::from_secs(20)).await;
+    }
+}
+
+// ============================================================================
+// HOOFDSTUK 12 – SELF-EVALUATOR (ZELFLEREND)
+// ============================================================================
+
+
+async fn run_self_evaluator(engine: Engine) {
+    loop {
+        sleep(Duration::from_secs(60)).await;
+        let now_ts = Utc::now().timestamp();
+
+        let mut updated = false;
+        {
+            let mut weights = engine.weights.lock().unwrap();
+            let mut sigs = engine.signals.lock().unwrap();
+
+            for ev in sigs.iter_mut() {
+                if ev.evaluated {
+                    continue;
+                }
+                if now_ts - ev.ts < 300 {
+                    continue;
+                }
+                if ev.rating == "NONE" {
+                    ev.evaluated = true;
+                    continue;
+                }
+
+                let current_price = engine
+                    .candles
+                    .get(&ev.pair)
+                    .and_then(|c| c.close)
+                    .unwrap_or(ev.price);
+
+                let ret = (current_price - ev.price) / ev.price * 100.0;
+
+                let success_strong = ret >= 2.0;
+                let success_weak = ret >= 0.5 && ret < 2.0;
+                let fail = ret <= -0.5;
+
+                let strong_step_up = 1.02;
+                let weak_step_up = 1.01;
+                let step_down = 0.98;
+
+                let adjust = |w: &mut f64, factor_score: f64| {
+                    if factor_score <= 0.0 {
+                        return;
+                    }
+                    if success_strong {
+                        *w *= strong_step_up;
+                    } else if success_weak {
+                        *w *= weak_step_up;
+                    } else if fail {
+                        *w *= step_down;
+                    }
+                    if *w < 0.2 {
+                        *w = 0.2;
+                    }
+                    if *w > 5.0 {
+                        *w = 5.0;
+                    }
+                };
+
+                adjust(&mut weights.flow_w, ev.flow_score);
+                adjust(&mut weights.price_w, ev.price_score);
+                adjust(&mut weights.whale_w, ev.whale_score);
+                adjust(&mut weights.volume_w, ev.volume_score);
+                adjust(&mut weights.anomaly_w, ev.anomaly_score);
+                adjust(&mut weights.trend_w, ev.trend_score);
+
+                // backtest-data invullen
+                ev.ret_5m = Some(ret);
+                ev.eval_horizon_sec = Some(now_ts - ev.ts);
+
+                // momentum bewaren (als nog 0, herbereken)
+                if ev.momentum == 0.0 {
+                    ev.momentum = compute_momentum(ev.pct, ev.pump_score, ev.flow_pct);
+                }
+
+                ev.evaluated = true;
+                updated = true;
+            }
+
+            if updated {
+                println!(
+                    "Gewichten geüpdatet -> flow:{:.2} price:{:.2} whale:{:.2} vol:{:.2} anom:{:.2} trend:{:.2}",
+                    weights.flow_w,
+                    weights.price_w,
+                    weights.whale_w,
+                    weights.volume_w,
+                    weights.anomaly_w,
+                    weights.trend_w
+                );
+            }
+        }
+    }
+}
+
+// ============================================================================
+// HOOFDSTUK 13 – CLEANUP & ONDERHOUD (AGRESSIEVER GEMAAKT)
+// ============================================================================
+
+
+async fn run_cleanup(engine: Engine) {
+    loop {
+        sleep(Duration::from_secs(600)).await; // Nog steeds elke 10 min, maar agressiever
+
+        let now = Utc::now().timestamp();
+        let cutoff_trades = now - 12 * 3600;
+        let cutoff_candles = now - 24 * 3600;
+        let cutoff_orderbooks = now - 60; // Remove orderbooks older than 1 minute
+
+        engine.trades.retain(|_, v| v.last_update_ts >= cutoff_trades);
+
+        let mut to_reset = Vec::new();
+        for c in engine.candles.iter() {
+            let last_ts = c.last_ts.unwrap_or(0);
+            if last_ts < cutoff_candles {
+                to_reset.push(c.key().clone());
+            }
+        }
+        for k in to_reset {
+            engine.candles.insert(k, CandleState::default());
+        }
+
+        // Cleanup old orderbooks
+        engine.orderbooks.retain(|_, v| v.timestamp >= cutoff_orderbooks);
+
+        // NIEUW: Reset recente ANOM flags na 5 uur
+        let cutoff_anom = now - (5 * 3600); // 5 uur
+        for mut t in engine.trades.iter_mut() {
+            if t.last_update_ts < cutoff_anom {
+                t.recent_anom = false;
+            }
+        }
+
+        // FIX: Houd alleen signals van laatste 24 uur om Type kolom te vullen
+        {
+            let mut sigs = engine.signals.lock().unwrap();
+            sigs.retain(|ev| now - ev.ts < 86400); // 24 uur
+        }
+
+        // NIEUW: Cleanup dir_history voor entries ouder dan 24 uur
+        let cutoff_dir = now - 86400; // 24 uur
+        for mut t in engine.trades.iter_mut() {
+            t.dir_history.retain(|(ts, _)| *ts >= cutoff_dir);
+        }
+
+        println!("Cleanup: oude trades (>12u), candles (>24u), orderbooks (>1m) en dir_history (>24u) opgeschoond, oude ANOM flags gereset.");
+    }
+}
+
+// NIEUW: Agressieve cleanup elke 5 minuten
+async fn run_aggressive_cleanup(engine: Engine) {
+    let mut interval = tokio::time::interval(Duration::from_secs(300)); // Elke 5 minuten
+    loop {
+        interval.tick().await;
+        let now = Utc::now().timestamp();
+
+        // Log sizes voor debugging
+        let trades_count: usize = engine.trades.iter().map(|_| 1).sum();
+        let candles_count: usize = engine.candles.iter().map(|_| 1).sum();
+        let signals_count = engine.signals.lock().unwrap().len();
+        let stars_count = engine.stars_history.lock().unwrap().history.len();
+        println!("[HEALTH] trades: {}, candles: {}, signals: {}, stars: {}", trades_count, candles_count, signals_count, stars_count);
+
+        // Cleanup trades: verwijder oude pairs volledig na 6 uur inactiviteit
+        let cutoff_old = now - 6 * 3600;
+        engine.trades.retain(|_, v| v.last_update_ts >= cutoff_old);
+
+        // Cleanup candles: max 500 entries totaal
+        let mut candle_keys: Vec<String> = engine.candles.iter().map(|k| k.key().clone()).collect();
+        if candle_keys.len() > 500 {
+            candle_keys.sort_by_key(|k| engine.candles.get(k).map(|c| c.last_update_ts).unwrap_or(0));
+            for key in candle_keys.iter().take(candle_keys.len() - 500) {
+                engine.candles.remove(key);
+            }
+        }
+
+        // Signals: max 200 (strenger dan 400)
+        let mut sigs = engine.signals.lock().unwrap();
+        let sigs_len = sigs.len();
+        if sigs_len > 200 {
+            sigs.drain(0..(sigs_len - 200));
+        }
+        drop(sigs);
+
+        // Stars: max 500 entries (minder dan 1000)
+        let mut history = engine.stars_history.lock().unwrap();
+        let history_len = history.history.len();
+        if history_len > 500 {
+            history.history.drain(0..(history_len - 500));
+            history.dirty = true; // Markeer voor save
+        }
+        drop(history);
+
+        // Orderbooks: max 100 recente
+        let cutoff_ob = now - 120; // 2 minuten
+        engine.orderbooks.retain(|_, v| v.timestamp >= cutoff_ob);
+
+        println!("[CLEANUP] Aggressive cleanup done");
+    }
 }
