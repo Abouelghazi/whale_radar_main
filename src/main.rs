@@ -398,7 +398,7 @@ struct OrderbookState {
     timestamp: i64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Row {
     pair: String,
     price: f64,
@@ -2221,7 +2221,7 @@ impl Engine {
         if is_stablecoin(&ev.pair) {
             return None;
         }
-        if ev.flow_pct < 50.0 {  // Verlaagd van 55.0
+        if ev.flow_pct < 30.0 {  // Verlaagd van 50
             return None;
         }
         let momentum_val = if ev.momentum == 0.0 {
@@ -2229,17 +2229,17 @@ impl Engine {
         } else {
             ev.momentum
         };
-        if momentum_val < 40.0 {  // Verlaagd van 50.0
+        if momentum_val < 20.0 {  // Verlaagd van 40
             return None;
         }
-        if ev.pump_score < 3.0 {
+        if ev.pump_score < 1.0 {
             return None;
         }
-        if ev.whale_pred_score < 4.0 {
+        if ev.whale_pred_score < 1.0 {
             return None;
         }
         let now_ts = Utc::now().timestamp();
-        if now_ts.saturating_sub(ev.ts) > 180 {
+        if now_ts.saturating_sub(ev.ts) > 600 {  // Verlengd van 180
             return None;
         }
 
@@ -2714,25 +2714,25 @@ impl Engine {
             let flow_pct = r.flow_pct;
             let momentum = compute_momentum(r.pct, r.pump_score, r.flow_pct);
 
-            // Pre-filters: alleen sterke kandidaten
-            if flow_pct < 50.0 {
-                println!("[FORECAST SKIP] {}: flow {:.1} < 50", r.pair, r.flow_pct);
+            // Pre-filters: alleen sterke kandidaten (versoepeld)
+            if flow_pct < 30.0 {
+                println!("[FORECAST SKIP] {}: flow {:.1} < 30", r.pair, r.flow_pct);
                 continue;
             }
-            if momentum < 50.0 {
-                println!("[FORECAST SKIP] {}: momentum {:.1} < 50", r.pair, momentum);
+            if momentum < 30.0 {
+                println!("[FORECAST SKIP] {}: momentum {:.1} < 30", r.pair, momentum);
                 continue;
             }
-            if r.pump_score < 2.0 {
-                println!("[FORECAST SKIP] {}: pump_score {:.1} < 2", r.pair, r.pump_score);
+            if r.pump_score < 1.0 {
+                println!("[FORECAST SKIP] {}: pump_score {:.1} < 1", r.pair, r.pump_score);
                 continue;
             }
-            if r.whale_pred_score < 3.0 {
-                println!("[FORECAST SKIP] {}: whale_pred_score {:.1} < 3", r.pair, r.whale_pred_score);
+            if r.whale_pred_score < 1.5 {
+                println!("[FORECAST SKIP] {}: whale_pred_score {:.1} < 1.5", r.pair, r.whale_pred_score);
                 continue;
             }
-            if now_ts - r.ts > 300 {
-                println!("[FORECAST SKIP] {}: age {} > 300", r.pair, now_ts - r.ts);
+            if now_ts - r.ts > 600 {
+                println!("[FORECAST SKIP] {}: age {} > 600", r.pair, now_ts - r.ts);
                 continue;
             }
 
@@ -2744,9 +2744,9 @@ impl Engine {
             }
             let (entry_low, entry_mid, entry_high) = zone.unwrap();
 
-            // Sanity check met ATR: zone niet te breed
+            // Sanity check met ATR: zone niet te breed (versoepeld)
             let atr = short_atr_1m(&prices);
-            if entry_high - entry_low > atr * 2.0 {
+            if entry_high - entry_low > atr * 3.0 {
                 continue; // Zone te breed, skip
             }
 
@@ -2769,8 +2769,8 @@ impl Engine {
                     };
                     let bid_depth: f64 = ob.bids.iter().take(10).map(|(_, v)| v).sum();
                     let ask_depth: f64 = ob.asks.iter().take(10).map(|(_, v)| v).sum();
-                    let depth_ok = bid_depth > 10.0 && ask_depth > 10.0 && spread_bps <= 10.0; // Arbitrair, aanpassen
-                    let guard_notes = if spread_bps > 10.0 {
+                    let depth_ok = bid_depth > 10.0 && ask_depth > 10.0 && spread_bps <= 20.0; // Versoepeld van 10
+                    let guard_notes = if spread_bps > 20.0 {
                         "skip: spread too wide".to_string()
                     } else if !depth_ok {
                         "skip: low depth".to_string()
@@ -2786,7 +2786,7 @@ impl Engine {
             };
 
             // Skip als guards falen
-            if !depth_ok || spread_bps > 10.0 {
+            if !depth_ok || spread_bps > 20.0 {
                 continue;
             }
 
@@ -2901,7 +2901,7 @@ impl Engine {
 // ============================================================================
 
 fn detect_flag_zone(prices: &[(f64, f64)]) -> Option<(f64, f64, f64)> {
-    if prices.len() < 5 {  // Verlaagd van 10
+    if prices.len() < 3 {  // Verlaagd van 5
         return None;
     }
     // Zoek impuls-high: hoogste price in laatste 10 candles
@@ -2914,7 +2914,7 @@ fn detect_flag_zone(prices: &[(f64, f64)]) -> Option<(f64, f64, f64)> {
 }
 
 fn short_atr_1m(prices: &[(f64, f64)]) -> f64 {
-    if prices.len() < 5 {  // Verlaagd van 2
+    if prices.len() < 3 {  // Verlaagd van 5
         return 0.0;
     }
     let mut trs = Vec::new();
@@ -4868,7 +4868,7 @@ async fn run_http(engine: Engine, config: Arc<Mutex<AppConfig>>) {
                 }
             }
 
-            // sla altijd op (verwijderd check)
+            // sla altijd op
             let _ = save_high_rise_local(&response.high_rise_logic).await;
             let _ = store_highrise_remote(&cfg_guard, &response.high_rise_logic).await;
 
