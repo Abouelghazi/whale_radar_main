@@ -170,12 +170,6 @@ struct AppConfig {
     // NIEUW: externe opslag voor High-Rise Logic
     high_rise_store_url: Option<String>,
     high_rise_store_token: Option<String>,
-    // NIEUW: Forecast-specifieke drempels
-    forecast_flow_min: f64,
-    forecast_momentum_min: f64,
-    forecast_pump_min: f64,
-    forecast_whale_pred_min: f64,
-    forecast_spread_max_bps: f64,
 }
 
 impl Default for AppConfig {
@@ -219,12 +213,6 @@ impl Default for AppConfig {
             // NIEUW: Externe opslag defaults
             high_rise_store_url: None,
             high_rise_store_token: None,
-            // NIEUW: Forecast defaults
-            forecast_flow_min: 55.0,
-            forecast_momentum_min: 60.0,
-            forecast_pump_min: 3.0,
-            forecast_whale_pred_min: 4.0,
-            forecast_spread_max_bps: 10.0,
         }
     }
 }
@@ -2717,7 +2705,7 @@ impl Engine {
     }
 
     // NIEUW: Forecast functie voor entry-planner
-    fn forecast_snapshot(&self, config: &AppConfig) -> Vec<ForecastRow> {
+    fn forecast_snapshot(&self) -> Vec<ForecastRow> {
         let now_ts = Utc::now().timestamp();
         let rows = self.snapshot(); // Gebruik snapshot() voor alle actieve pairs
         let mut forecasts: Vec<ForecastRow> = Vec::new();
@@ -2727,19 +2715,12 @@ impl Engine {
             let momentum = compute_momentum(r.pct, r.pump_score, r.flow_pct);
 
             // Pre-filters: alleen sterke kandidaten
-            if flow_pct < config.forecast_flow_min {
-                continue;
-            }
-            if momentum < config.forecast_momentum_min {
-                continue;
-            }
-            if r.pump_score < config.forecast_pump_min {
-                continue;
-            }
-            if r.whale_pred_score < config.forecast_whale_pred_min {
-                continue;
-            }
-            if now_ts - r.ts > 180 {
+            if flow_pct < 55.0
+                || momentum < 60.0
+                || r.pump_score < 3.0
+                || r.whale_pred_score < 4.0
+                || now_ts - r.ts > 180
+            {
                 continue; // Skip als niet sterk genoeg
             }
 
@@ -2776,8 +2757,8 @@ impl Engine {
                     };
                     let bid_depth: f64 = ob.bids.iter().take(10).map(|(_, v)| v).sum();
                     let ask_depth: f64 = ob.asks.iter().take(10).map(|(_, v)| v).sum();
-                    let depth_ok = bid_depth > 10.0 && ask_depth > 10.0 && spread_bps <= config.forecast_spread_max_bps; // Gebruik config
-                    let guard_notes = if spread_bps > config.forecast_spread_max_bps {
+                    let depth_ok = bid_depth > 10.0 && ask_depth > 10.0 && spread_bps <= 10.0; // Arbitrair, aanpassen
+                    let guard_notes = if spread_bps > 10.0 {
                         "skip: spread too wide".to_string()
                     } else if !depth_ok {
                         "skip: low depth".to_string()
@@ -2793,7 +2774,7 @@ impl Engine {
             };
 
             // Skip als guards falen
-            if !depth_ok || spread_bps > config.forecast_spread_max_bps {
+            if !depth_ok || spread_bps > 10.0 {
                 continue;
             }
 
@@ -3075,7 +3056,7 @@ tr:nth-child(even){ background:#252525; }
           <th>Time</th><th>Pair</th><th>Price</th><th>%</th><th>Whale</th>
           <th>Flow</th><th>Dir</th><th>Early</th><th>Alpha</th><th>Pump</th>
           <th>WhPred</th><th>Rel</th><th>Total score</th><th>Trades</th><th>Buys</th><th>Sells</th>
-          <th>C</th>
+          <th>O</th><th>H</th><th>L</th><th>C</th>
           <th>Avg Buy Dur (s)</th><th>Avg Sell Dur (s)</th><th>Avg Neutr Dur (s)</th>
           <th>Visual</th>
         </tr>
@@ -3462,18 +3443,6 @@ tr:nth-child(even){ background:#252525; }
       <label>Max Weight (3.0-10.0):</label>
       <input type="number" step="0.5" min="3.0" max="10.0" id="ai_max_weight" /><br/>
 
-      <h3>7. Forecast Specifieke Drempels</h3>
-      <label>Forecast Min Flow %:</label>
-      <input type="number" step="1" min="0" max="100" id="forecast_flow_min" /><br/>
-      <label>Forecast Min Momentum:</label>
-      <input type="number" step="1" min="0" max="100" id="forecast_momentum_min" /><br/>
-      <label>Forecast Min Pump Score:</label>
-      <input type="number" step="0.1" min="0.0" max="10.0" id="forecast_pump_min" /><br/>
-      <label>Forecast Min WhalePred Score:</label>
-      <input type="number" step="0.1" min="0.0" max="10.0" id="forecast_whale_pred_min" /><br/>
-      <label>Forecast Max Spread Bps:</label>
-      <input type="number" step="1" min="0" max="1000" id="forecast_spread_max_bps" /><br/>
-
       <button type="button" id="save-config">Save Config</button>
       <button type="button" id="reset-config">Reset to Defaults</button>
     </form>
@@ -3701,6 +3670,9 @@ async function loadMarkets() {
       <td>${r.trades}</td>
       <td>${r.buys.toFixed(4)}</td>
       <td>${r.sells.toFixed(4)}</td>
+      <td>${r.o.toFixed(4)}</td>
+      <td>${r.h.toFixed(4)}</td>
+      <td>${r.l.toFixed(4)}</td>
       <td>${r.c.toFixed(4)}</td>
       <td>${avgBuyDur}</td>
       <td>${avgSellDur}</td>
@@ -3710,8 +3682,8 @@ async function loadMarkets() {
 
     tbody.innerHTML += row;
   }
-  applyDirFilter('grid', 'markets-dir-filter', 6); // Dir is kolom 6
-  highlightPriorityPair('grid', 1); // Pair is kolom 1
+  applyDirFilter('grid', 'markets-dir-filter', 6); // Adjusted for new Time column
+  highlightPriorityPair('grid', 1); // Pair is now in kolom 1
 }
 
 function fmtTime(ts) {
@@ -4732,7 +4704,7 @@ window.addEventListener("load", () => {
 });
 
 // Event listeners voor filters
-document.getElementById('markets-dir-filter').addEventListener('change', () => applyDirFilter('grid', 'markets-dir-filter', 6)); // Dir is kolom 6
+document.getElementById('markets-dir-filter').addEventListener('change', () => applyDirFilter('grid', 'markets-dir-filter', 6)); // Adjusted for new Time column
 document.getElementById('signals-dir-filter').addEventListener('change', () => loadSignals());
 document.getElementById('signals-type-filter').addEventListener('change', () => loadSignals());
 document.getElementById('top10-dir-filter').addEventListener('change', () => {
@@ -4942,11 +4914,7 @@ async fn run_http(engine: Engine, config: Arc<Mutex<AppConfig>>) {
     // NIEUW: API voor forecast voorspellingen
     let api_forecast = warp::path!("api" / "forecast")
         .and(engine_filter.clone())
-        .and(config_filter.clone())
-        .map(|engine: Engine, config: Arc<Mutex<AppConfig>>| {
-            let cfg = config.lock().unwrap().clone();
-            warp::reply::json(&engine.forecast_snapshot(&cfg))
-        });
+        .map(|engine: Engine| warp::reply::json(&engine.forecast_snapshot()));
 
     // NIEUW: API voor coin analyse (on-demand)
     let api_coin_analysis = warp::path!("api" / "coin_analysis" / String / String)
