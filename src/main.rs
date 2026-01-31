@@ -398,7 +398,7 @@ struct OrderbookState {
     timestamp: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 struct Row {
     pair: String,
     price: f64,
@@ -2221,7 +2221,7 @@ impl Engine {
         if is_stablecoin(&ev.pair) {
             return None;
         }
-        if ev.flow_pct < 30.0 {  // Verlaagd van 50
+        if ev.flow_pct < 55.0 {
             return None;
         }
         let momentum_val = if ev.momentum == 0.0 {
@@ -2229,17 +2229,17 @@ impl Engine {
         } else {
             ev.momentum
         };
-        if momentum_val < 20.0 {  // Verlaagd van 40
+        if momentum_val < 50.0 {
             return None;
         }
-        if ev.pump_score < 1.0 {
+        if ev.pump_score < 3.0 {
             return None;
         }
-        if ev.whale_pred_score < 1.0 {
+        if ev.whale_pred_score < 4.0 {
             return None;
         }
         let now_ts = Utc::now().timestamp();
-        if now_ts.saturating_sub(ev.ts) > 600 {  // Verlengd van 180
+        if now_ts.saturating_sub(ev.ts) > 180 {
             return None;
         }
 
@@ -2272,7 +2272,7 @@ impl Engine {
                 return Some(h.threshold.min(100.0));
             }
         }
-        Some(0.0)  // Fallback toegevoegd
+        None
     }
 
     fn get_high_rise_logic(&self) -> Option<Vec<HighRiseLogic>> {
@@ -2714,26 +2714,14 @@ impl Engine {
             let flow_pct = r.flow_pct;
             let momentum = compute_momentum(r.pct, r.pump_score, r.flow_pct);
 
-            // Pre-filters: alleen sterke kandidaten (versoepeld)
-            if flow_pct < 30.0 {
-                println!("[FORECAST SKIP] {}: flow {:.1} < 30", r.pair, r.flow_pct);
-                continue;
-            }
-            if momentum < 30.0 {
-                println!("[FORECAST SKIP] {}: momentum {:.1} < 30", r.pair, momentum);
-                continue;
-            }
-            if r.pump_score < 1.0 {
-                println!("[FORECAST SKIP] {}: pump_score {:.1} < 1", r.pair, r.pump_score);
-                continue;
-            }
-            if r.whale_pred_score < 1.5 {
-                println!("[FORECAST SKIP] {}: whale_pred_score {:.1} < 1.5", r.pair, r.whale_pred_score);
-                continue;
-            }
-            if now_ts - r.ts > 600 {
-                println!("[FORECAST SKIP] {}: age {} > 600", r.pair, now_ts - r.ts);
-                continue;
+            // Pre-filters: alleen sterke kandidaten
+            if flow_pct < 55.0
+                || momentum < 60.0
+                || r.pump_score < 3.0
+                || r.whale_pred_score < 4.0
+                || now_ts - r.ts > 180
+            {
+                continue; // Skip als niet sterk genoeg
             }
 
             // Detecteer flag/pullback zone uit recente prices
@@ -2744,9 +2732,9 @@ impl Engine {
             }
             let (entry_low, entry_mid, entry_high) = zone.unwrap();
 
-            // Sanity check met ATR: zone niet te breed (versoepeld)
+            // Sanity check met ATR: zone niet te breed
             let atr = short_atr_1m(&prices);
-            if entry_high - entry_low > atr * 3.0 {
+            if entry_high - entry_low > atr * 2.0 {
                 continue; // Zone te breed, skip
             }
 
@@ -2769,8 +2757,8 @@ impl Engine {
                     };
                     let bid_depth: f64 = ob.bids.iter().take(10).map(|(_, v)| v).sum();
                     let ask_depth: f64 = ob.asks.iter().take(10).map(|(_, v)| v).sum();
-                    let depth_ok = bid_depth > 10.0 && ask_depth > 10.0 && spread_bps <= 20.0; // Versoepeld van 10
-                    let guard_notes = if spread_bps > 20.0 {
+                    let depth_ok = bid_depth > 10.0 && ask_depth > 10.0 && spread_bps <= 10.0; // Arbitrair, aanpassen
+                    let guard_notes = if spread_bps > 10.0 {
                         "skip: spread too wide".to_string()
                     } else if !depth_ok {
                         "skip: low depth".to_string()
@@ -2786,7 +2774,7 @@ impl Engine {
             };
 
             // Skip als guards falen
-            if !depth_ok || spread_bps > 20.0 {
+            if !depth_ok || spread_bps > 10.0 {
                 continue;
             }
 
@@ -2901,7 +2889,7 @@ impl Engine {
 // ============================================================================
 
 fn detect_flag_zone(prices: &[(f64, f64)]) -> Option<(f64, f64, f64)> {
-    if prices.len() < 3 {  // Verlaagd van 5
+    if prices.len() < 10 {
         return None;
     }
     // Zoek impuls-high: hoogste price in laatste 10 candles
@@ -2914,11 +2902,11 @@ fn detect_flag_zone(prices: &[(f64, f64)]) -> Option<(f64, f64, f64)> {
 }
 
 fn short_atr_1m(prices: &[(f64, f64)]) -> f64 {
-    if prices.len() < 3 {  // Verlaagd van 5
+    if prices.len() < 2 {
         return 0.0;
     }
     let mut trs = Vec::new();
-    for i in 1..prices.len().min(15) {  // Beperkt tot min 15
+    for i in 1..prices.len() {
         let (_, high) = prices[i];
         let (_, low) = prices[i];
         let (_, prev_close) = prices[i - 1];
@@ -4868,9 +4856,11 @@ async fn run_http(engine: Engine, config: Arc<Mutex<AppConfig>>) {
                 }
             }
 
-            // sla altijd op
-            let _ = save_high_rise_local(&response.high_rise_logic).await;
-            let _ = store_highrise_remote(&cfg_guard, &response.high_rise_logic).await;
+            // sla alleen op als er betekenisvolle (niet-nul) waarden zijn
+            if highrise_has_nonzero(&response.high_rise_logic) {
+                let _ = save_high_rise_local(&response.high_rise_logic).await;
+                let _ = store_highrise_remote(&cfg_guard, &response.high_rise_logic).await;
+            }
 
             Ok::<_, warp::Rejection>(warp::reply::json(&response))
         });
@@ -5151,44 +5141,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = Arc::new(Mutex::new(load_config().await));
     let engine = Engine::new();
-    
-    // NIEUW: Preload dummy high-rise data bij startup voor debug
-    let dummy_hr = vec![
-        HighRiseLogic {
-            threshold: 5.0,
-            occurrences: 10,
-            avg_whale_pred_score: 5.0,
-            avg_pump_score: 3.0,
-            avg_flow_pct: 60.0,
-            avg_momentum: 55.0,
-            updated_at: Some(Utc::now().timestamp()),
-            total_signals: 100,
-            hit_rate: 50.0,
-        },
-        HighRiseLogic {
-            threshold: 10.0,
-            occurrences: 5,
-            avg_whale_pred_score: 6.0,
-            avg_pump_score: 4.0,
-            avg_flow_pct: 65.0,
-            avg_momentum: 60.0,
-            updated_at: Some(Utc::now().timestamp()),
-            total_signals: 100,
-            hit_rate: 40.0,
-        },
-        HighRiseLogic {
-            threshold: 15.0,
-            occurrences: 2,
-            avg_whale_pred_score: 7.0,
-            avg_pump_score: 5.0,
-            avg_flow_pct: 70.0,
-            avg_momentum: 65.0,
-            updated_at: Some(Utc::now().timestamp()),
-            total_signals: 100,
-            hit_rate: 30.0,
-        },
-    ];
-    engine.high_rise_cache.lock().unwrap().replace(dummy_hr);
     
     // Load manual trader state from JSON
     engine.load_manual_trader().await;
